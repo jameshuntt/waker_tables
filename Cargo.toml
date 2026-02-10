@@ -1,0 +1,14 @@
+[package]
+name = "waker_tables"
+version = "0.1.0"
+edition = "2024"
+
+license = "MIT OR Apache-2.0"
+description = "custom raw waker logic"
+
+authors = ["James Hunt <jameshuntdevelopment@gmail.com>"]
+repository = "https://github.com/jameshuntt/waker_tables"
+readme = "readme.md"
+
+[dependencies]
+once_cell = "1.21.3"
