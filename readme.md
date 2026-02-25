@@ -354,4 +354,4 @@ This crate is for people who want to own their runtime boundaries.
 
 ## License
 
-MIT / Apache-2.0 (pick whatever your repo uses)
+MIT & Apache-2.0
