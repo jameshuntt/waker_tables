@@ -138,12 +138,12 @@ impl<T: UnsafeWakeable> SmartWakerPtr<T> {
     /// # Safety
     /// The pointer must have been created by `SmartWakerPtr::from_arc`.
     pub unsafe fn to_arc(self) -> Arc<T> {
-        Arc::from_raw(self.0)
+        unsafe { Arc::from_raw(self.0) }
     }
 
     /// Clone the underlying `Arc` without dropping the original.
     pub unsafe fn to_cloned_arc(&self) -> Arc<T> {
-        let arc = Arc::from_raw(self.0);
+        let arc = unsafe { Arc::from_raw(self.0) };
         let cloned = arc.clone();
         std::mem::forget(arc);
         cloned
@@ -207,15 +207,15 @@ impl UnsafeWakeablePtr {
     /// # Safety
     /// `self.data` must be a valid `UnsafeWakeableTask` for this vtable.
     pub unsafe fn poll(&mut self) -> Poll<()> {
-        (self.vtable.poll_fn)(self.data)
+        unsafe { (self.vtable.poll_fn)(self.data) }
     }
 
     pub unsafe fn wake(&self) {
-        (self.vtable.wake_fn)(self.data as *const ())
+        unsafe { (self.vtable.wake_fn)(self.data as *const ()) }
     }
 
     pub unsafe fn drop_in_place(&mut self) {
-        (self.vtable.drop_fn)(self.data)
+        unsafe { (self.vtable.drop_fn)(self.data) }
     }
 }
 
@@ -368,16 +368,16 @@ impl RegisteredTask {
     /// Caller must ensure exclusive access to the underlying task while
     /// it is being polled.
     pub unsafe fn poll(&mut self) -> Poll<()> {
-        self.ptr.poll()
+        unsafe { self.ptr.poll() }
     }
 
     pub unsafe fn wake(&self) {
-        self.ptr.wake()
+        unsafe { self.ptr.wake() }
     }
 
     /// Drop the underlying task in-place via vtable.
     pub unsafe fn drop_in_place(&mut self) {
-        self.ptr.drop_in_place()
+        unsafe { self.ptr.drop_in_place() }
     }
 }
 
