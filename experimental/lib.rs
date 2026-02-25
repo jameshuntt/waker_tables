@@ -6,7 +6,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
 use std::task::{Poll, RawWaker, RawWakerVTable, Waker};
 
-use std::sync::LazyLock;
+use once_cell::sync::Lazy;
 
 /* ================================
    1. RawWaker / UnsafeWakeable
@@ -326,8 +326,8 @@ impl VTableRegistry {
 }
 
 /// One global registry (optional; you can ignore it and build your own).
-pub static GLOBAL_VTABLE_REGISTRY: LazyLock<VTableRegistry> = LazyLock::new(VTableRegistry::new);
-
+pub static GLOBAL_VTABLE_REGISTRY: Lazy<VTableRegistry> =
+    Lazy::new(VTableRegistry::new);
 
 /* ================================
    4. Safety wrapper: RegisteredTask
