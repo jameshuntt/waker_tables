@@ -394,4 +394,4 @@ task drop. The code blocks in this README run as doctests.
 
 ## License
 
-MIT & Apache-2.0
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
