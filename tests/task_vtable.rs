@@ -46,6 +46,7 @@ impl Drop for Countdown {
     }
 }
 
+// SAFETY: the functions only touch `self` and its log.
 unsafe impl UnsafeWakeableTask for Countdown {
     unsafe fn poll(&mut self) -> Poll<()> {
         self.polls += 1;
@@ -73,6 +74,7 @@ fn ptr_calls_go_to_the_task() {
     let data = Box::into_raw(Countdown::boxed(3, &log));
     let mut ptr = UnsafeWakeablePtr { data: data as *mut (), vtable: &COUNTDOWN_VTABLE };
 
+    // SAFETY: `ptr` holds a live Countdown with Countdown's vtable, used only here.
     unsafe {
         assert_eq!(ptr.poll(), Poll::Pending);
         assert_eq!(ptr.poll(), Poll::Pending);
@@ -84,6 +86,7 @@ fn ptr_calls_go_to_the_task() {
     assert_eq!(Log::get(&log.cleanups), 1);
     assert_eq!(Log::get(&log.drops), 0, "the bare ptr does not own the task");
 
+    // SAFETY: `data` came from Box::into_raw above and is freed once.
     drop(unsafe { Box::from_raw(data) });
     assert_eq!(Log::get(&log.drops), 1);
 }
@@ -95,7 +98,9 @@ fn registered_task_runs_and_frees_once() {
     let log = Arc::new(Log::default());
 
     let mut task = RegisteredTask::new(Countdown::boxed(2, &log), k);
-    assert_eq!(task.key, k);
+    assert_eq!(task.key(), k);
+    assert!(task.ptr().vtable.is_for::<Countdown>());
+    // SAFETY: Countdown's functions assume nothing beyond exclusive access.
     unsafe {
         assert_eq!(task.poll(), Poll::Pending);
         task.wake();
@@ -116,6 +121,7 @@ fn drop_in_place_then_drop_frees_once() {
     let log = Arc::new(Log::default());
 
     let mut task = RegisteredTask::new(Countdown::boxed(1, &log), k);
+    // SAFETY: as above.
     unsafe { task.drop_in_place() };
     assert_eq!(Log::get(&log.cleanups), 1);
     assert_eq!(Log::get(&log.drops), 0);
@@ -132,6 +138,7 @@ fn many_tasks_each_freed() {
 
     let mut tasks: Vec<_> = (1..=20).map(|n| RegisteredTask::new(Countdown::boxed(n, &log), k)).collect();
     for task in &mut tasks {
+        // SAFETY: as above.
         while unsafe { task.poll() }.is_pending() {}
     }
     drop(tasks);
@@ -166,11 +173,7 @@ fn registry_get_register_and_replace() {
     assert!(std::ptr::eq(registry.get(&k).unwrap(), &COUNTDOWN_VTABLE));
     assert!(registry.get(&key("local", 2)).is_none(), "the version is part of the key");
 
-    static OTHER: waker_tables::UnsafeWakeableVTable = waker_tables::UnsafeWakeableVTable {
-        poll_fn: |_| Poll::Ready(()),
-        wake_fn: |_| {},
-        drop_fn: |_| {},
-    };
+    static OTHER: waker_tables::UnsafeWakeableVTable = waker_tables::UnsafeWakeableVTable::of::<Plain>();
     registry.register(k, &OTHER);
     assert!(std::ptr::eq(registry.get(&k).unwrap(), &OTHER), "register replaces");
 }
@@ -196,5 +199,62 @@ fn debug_output() {
         format!("{:?}", key("k", 3)),
         "VTableKey { segment: \"tests\", kind: \"k\", version: 3 }"
     );
-    assert_eq!(format!("{:?}", COUNTDOWN_VTABLE), "UnsafeWakeableVTable { .. }");
+    assert_eq!(format!("{:?}", COUNTDOWN_VTABLE), "UnsafeWakeableVTable { type_name: \"task_vtable::Countdown\", .. }");
+}
+
+/// A second task type, for the mismatch checks.
+struct Plain;
+
+// SAFETY: the functions touch nothing.
+unsafe impl UnsafeWakeableTask for Plain {
+    unsafe fn poll(&mut self) -> Poll<()> {
+        Poll::Ready(())
+    }
+
+    unsafe fn wake(&self) {}
+
+    unsafe fn drop_in_place(&mut self) {}
+}
+
+derive_unsafe_wakeable_vtable!(Plain, PLAIN_VTABLE);
+
+#[test]
+#[should_panic(expected = "is for task_vtable::Countdown, not task_vtable::Plain")]
+fn key_for_another_type_panics() {
+    let k = key("countdown", 4);
+    GLOBAL_VTABLE_REGISTRY.register(k, &COUNTDOWN_VTABLE);
+    let _ = RegisteredTask::new(Box::new(Plain), k);
+}
+
+#[test]
+fn key_for_another_type_panics_without_leaking_the_task() {
+    let k = key("plain", 1);
+    GLOBAL_VTABLE_REGISTRY.register(k, &PLAIN_VTABLE);
+    let log = Arc::new(Log::default());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        RegisteredTask::new(Countdown::boxed(1, &log), k)
+    }));
+    assert!(result.is_err());
+    assert_eq!(Log::get(&log.drops), 1);
+}
+
+#[test]
+fn re_registering_a_key_leaves_existing_tasks_on_their_vtable() {
+    let k = key("swap", 1);
+    GLOBAL_VTABLE_REGISTRY.register(k, &COUNTDOWN_VTABLE);
+    let log = Arc::new(Log::default());
+    let mut task = RegisteredTask::new(Countdown::boxed(2, &log), k);
+
+    GLOBAL_VTABLE_REGISTRY.register(k, &PLAIN_VTABLE);
+    // SAFETY: as above.
+    assert_eq!(unsafe { task.poll() }, Poll::Pending, "still Countdown's poll");
+    drop(task);
+    assert_eq!(Log::get(&log.drops), 1);
+}
+
+#[test]
+fn vtable_knows_its_type() {
+    assert!(COUNTDOWN_VTABLE.is_for::<Countdown>());
+    assert!(!COUNTDOWN_VTABLE.is_for::<Plain>());
+    assert_eq!((PLAIN_VTABLE.type_name)(), "task_vtable::Plain");
 }

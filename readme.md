@@ -56,6 +56,10 @@ You promise that:
 - the `data: *mut ()` matches the vtable you call it with
 - you uphold any exclusivity invariants around polling (like you would with futures)
 
+`RegisteredTask` takes the first promise off your hands: the vtable records its task type and
+`RegisteredTask::new` refuses a key registered for another type. A bare `UnsafeWakeablePtr` does not
+check; its methods are `unsafe` for that reason.
+
 This crate intentionally does not enforce a scheduler model — that’s your job.
 
 ---
@@ -64,14 +68,14 @@ This crate intentionally does not enforce a scheduler model — that’s your jo
 
 - `UnsafeWakeable` — wire your own type into `RawWakerVTable`
 - `derive_arc_unsafe_wakeable!` — convenience macro for the `Arc<T>` case
-- `declare_raw_waker_vtable!` — generate a `'static` `RawWakerVTable` for your type
-- `waker_from_arc` — build a real `Waker` from `Arc<T>` + vtable
+- `waker_from_arc` — build a real `Waker` from `Arc<T>`; the vtable is built from `T`
+- `declare_raw_waker_vtable!` — a `'static` copy of that vtable (kept for 0.1 code)
 
 - `UnsafeWakeableTask` — “task object” contract: `poll/wake/drop_in_place`
 - `derive_unsafe_wakeable_vtable!` — generate a `'static` function-pointer vtable
 - `UnsafeWakeablePtr` — thin “fat pointer” pair (`data + &'static vtable`)
 - `VTableRegistry` + `VTableKey` — segment/kind/version mapping to vtables
-- `RegisteredTask` — safer wrapper coupling a `VTableKey` with a task pointer
+- `RegisteredTask` — owns a boxed task: checks its vtable's type, runs it, frees it on drop
 
 ---
 
@@ -79,9 +83,9 @@ This crate intentionally does not enforce a scheduler model — that’s your jo
 
 Add the crate:
 
-```text
+```toml
 [dependencies]
-waker_tables = "0.x"
+waker_tables = "0.2"
 ```
 
 ---
@@ -94,12 +98,7 @@ This is the “I want `Waker` to call *my scheduler*” path.
 use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
 use std::task::Waker;
 
-use waker_tables::{
-    UnsafeWakeable,
-    derive_arc_unsafe_wakeable,
-    declare_raw_waker_vtable,
-    waker_from_arc,
-};
+use waker_tables::{derive_arc_unsafe_wakeable, waker_from_arc};
 
 struct MyTask {
     wakes: AtomicUsize,
@@ -115,11 +114,8 @@ impl MyTask {
 // Wire Arc<MyTask> into the UnsafeWakeable contract.
 derive_arc_unsafe_wakeable!(MyTask, on_wake);
 
-// Generate the vtable once.
-declare_raw_waker_vtable!(MyTask, MYTASK_RAW_VTABLE);
-
 fn make_waker(task: Arc<MyTask>) -> Waker {
-    waker_from_arc(task, &MYTASK_RAW_VTABLE)
+    waker_from_arc(task)
 }
 
 fn main() {
@@ -131,7 +127,8 @@ fn main() {
     // consuming wake
     w.wake();
 
-    assert!(task.wakes.load(Ordering::Relaxed) >= 2);
+    assert_eq!(task.wakes.load(Ordering::Relaxed), 2);
+    assert_eq!(Arc::strong_count(&task), 1);
 }
 ```
 
@@ -188,6 +185,8 @@ fn main() {
         let _ = ptr.poll();
         ptr.wake();
         ptr.drop_in_place();
+        // The bare pointer does not own the task: free it yourself (RegisteredTask does this for you).
+        drop(Box::from_raw(ptr.data as *mut CounterTask));
     }
 }
 ```
@@ -236,18 +235,22 @@ fn main() {
     GLOBAL_VTABLE_REGISTRY.register(etl_key, &ETL_VTABLE);
     GLOBAL_VTABLE_REGISTRY.register(search_key, &SEARCH_VTABLE);
 
-    let etl = RegisteredTask::new(Box::new(EtlTask), etl_key);
+    let mut etl = RegisteredTask::new(Box::new(EtlTask), etl_key);
     let mut search = RegisteredTask::new(Box::new(SearchTask), search_key);
 
     unsafe {
-        // etl: ready
-        let _ = etl.ptr.vtable.poll_fn(etl.ptr.data);
+        assert_eq!(etl.poll(), Poll::Ready(()));
 
-        // search: pending
-        let _ = search.poll();
+        assert_eq!(search.poll(), Poll::Pending);
         search.wake();
         search.drop_in_place();
     }
+
+    // A key registered for another type is refused.
+    let wrong = std::panic::catch_unwind(|| RegisteredTask::new(Box::new(EtlTask), search_key));
+    assert!(wrong.is_err());
+
+    // Dropping a RegisteredTask frees its task.
 }
 ```
 
@@ -304,7 +307,10 @@ fn main() {
     while let Some(mut t) = q.pop_front() {
         let p = unsafe { t.poll() };
         match p {
-            Poll::Ready(()) => unsafe { t.drop_in_place() },
+            Poll::Ready(()) => unsafe {
+                t.drop_in_place();
+                drop(Box::from_raw(t.data as *mut TickTask));
+            },
             Poll::Pending => q.push_back(t),
         }
     }
@@ -329,7 +335,11 @@ If you benchmark, remember:
 ## Common pitfalls
 
 - **Mixing pointer + vtable**: calling the wrong vtable for the wrong type is UB.  
-  Use `RegisteredTask` to couple `VTableKey` with the pointer.
+  Use `RegisteredTask`: it refuses a key whose vtable is for another type. Wakers cannot mix:
+  `waker_from_arc` builds `T`'s own vtable.
+
+- **Freeing tasks**: a bare `UnsafeWakeablePtr` does not own its task; `drop_in_place` runs the task's
+  cleanup hook but does not free it. `RegisteredTask` frees on drop.
 
 - **Polling concurrently**: if your task is not internally synchronized, you must ensure exclusive polling (just like futures).
 
@@ -352,9 +362,24 @@ This crate is for people who want to own their runtime boundaries.
 
 ---
 
-## License
+## 0.2.0
 
-MIT & Apache-2.0
+- `waker_from_arc(arc)` takes no vtable: it builds `T`'s own, so a waker can never run another
+  type's functions. `raw_waker_from_ptr(ptr)` likewise. `declare_raw_waker_vtable!` still compiles
+  and declares that same vtable.
+- `UnsafeWakeableVTable` records its task type (`type_id`, `type_name`); build it with
+  `UnsafeWakeableVTable::of::<T>()` or `derive_unsafe_wakeable_vtable!`.
+- `RegisteredTask::new` panics on a key registered for another type, and `RegisteredTask` frees its
+  task on drop (0.1 never freed it). Its fields are private: use `key()` and `ptr()`.
+- `SmartWakerPtr` frees its ref on drop; `to_arc` and `to_cloned_arc` are safe.
+
+## Examples
+
+```bash
+cargo run --example block_on     # a whole executor on waker_from_arc, woken by a timer thread
+cargo run --example task_table   # a round-robin table of RegisteredTasks of two types
+```
+
 ## Testing
 
 ```bash
@@ -363,4 +388,9 @@ cargo +nightly miri test
 MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-many-seeds=0..8" cargo +nightly miri test
 ```
 
-Miri reports a leaked task or a reference counted wrong; the tests check every `Arc` count and every task drop.
+Miri reports a leaked task or a reference counted wrong; the tests check every `Arc` count and every
+task drop. The code blocks in this README run as doctests.
+
+## License
+
+MIT & Apache-2.0
