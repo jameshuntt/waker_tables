@@ -6,8 +6,8 @@
 //!
 //! * **Wakers.** Put [`UnsafeWakeable`] on an `Arc`-backed type (usually with
 //!   [`derive_arc_unsafe_wakeable!`]) and [`waker_from_arc`] turns an `Arc<T>` into a
-//!   [`Waker`]. The `RawWakerVTable` is built from `T` itself, so a waker can only ever
-//!   run its own type's functions.
+//!   [`Waker`]. The `RawWakerVTable` is `T`'s own ([`UnsafeWakeable::raw_waker_vtable`]),
+//!   so a waker can only ever run its own type's functions.
 //! * **Tasks.** Put [`UnsafeWakeableTask`] on a task type, declare its vtable with
 //!   [`derive_unsafe_wakeable_vtable!`], register it under a [`VTableKey`], and
 //!   [`RegisteredTask`] owns the boxed task, runs it through the vtable, and frees it
@@ -58,6 +58,8 @@ use std::sync::LazyLock;
 /// - `clone_ptr` returns a new `*const Self` owning +1 strong `Arc` ref.
 /// - `drop_ptr` balances exactly one `clone_ptr` / `Arc::into_raw` and
 ///   must never be called twice for the same pointer.
+/// - `raw_waker_vtable`, if overridden, returns a `'static` copy of its default: the vtable
+///   whose functions read `data` as `*const Self` (what [`declare_raw_waker_vtable!`] declares).
 ///
 /// This is **purely about refcount and memory ownership**, not scheduling.
 /// Scheduling logic (enqueueing, routing, etc.) lives in your own types.
@@ -85,12 +87,31 @@ pub unsafe trait UnsafeWakeable: Send + Sync + 'static {
     /// # Safety
     /// `ptr` owns one strong ref of an `Arc<Self>`; it is not used again.
     unsafe fn drop_ptr(ptr: *const Self);
+
+    /// The `RawWakerVTable` every waker of `Self` carries: [`waker_from_arc`],
+    /// [`raw_waker_from_ptr`] and every clone of such a waker take it from here.
+    ///
+    /// `Waker::will_wake` compares vtable addresses. [`derive_arc_unsafe_wakeable!`] overrides
+    /// this with one `static` per type, so a waker and its clones always `will_wake` each other.
+    /// The default returns a reference to a constant, and an optimized build may hold more than
+    /// one copy of it, so for an impl that keeps the default `will_wake` is best-effort: a waker
+    /// and its own clone can report `false`.
+    fn raw_waker_vtable() -> &'static RawWakerVTable
+    where
+        Self: Sized,
+    {
+        &RawWakerVTableOf::<Self>::VTABLE
+    }
 }
 
 /// Helper macro for the common `Arc<T>`-backed case.
 ///
 /// You implement your *behavior* on `Arc<T>` and this macro wires
 /// the raw pointer plumbing correctly.
+///
+/// The method is called on an `Arc<T>` from a plain (not `unsafe`) fn, so it must be a safe
+/// method: an `unsafe fn` is refused with E0133 (examples below). Every waker of `T` carries
+/// one `static` vtable, so a waker and its clones always `will_wake` each other.
 ///
 /// ```
 /// use std::sync::Arc;
@@ -111,21 +132,55 @@ pub unsafe trait UnsafeWakeable: Send + Sync + 'static {
 /// waker_from_arc(task.clone()).wake();
 /// assert_eq!(task.wakes.load(Ordering::SeqCst), 1);
 /// ```
+///
+/// An `unsafe fn` method is refused:
+///
+/// ```compile_fail,E0133
+/// use std::sync::Arc;
+/// use waker_tables::derive_arc_unsafe_wakeable;
+///
+/// struct OnExecutorThread;
+/// impl OnExecutorThread {
+///     /// # Safety
+///     /// Only on the executor thread.
+///     unsafe fn on_wake(self: Arc<Self>) {}
+/// }
+/// derive_arc_unsafe_wakeable!(OnExecutorThread, on_wake);
+/// ```
+///
+/// ```compile_fail,E0133
+/// use std::ops::Deref;
+/// use std::sync::Arc;
+/// use waker_tables::{derive_arc_unsafe_wakeable, waker_from_arc};
+///
+/// struct Empty;
+/// impl Deref for Empty {
+///     type Target = Option<u8>;
+///     fn deref(&self) -> &Option<u8> { &None }
+/// }
+/// derive_arc_unsafe_wakeable!(Empty, unwrap_unchecked);
+/// waker_from_arc(Arc::new(Empty)).wake();
+/// ```
 #[macro_export]
 macro_rules! derive_arc_unsafe_wakeable {
     ($t:ty, $wake_method:ident) => {
-        // SAFETY: every fn below moves exactly the one strong ref its contract names.
+        // SAFETY: every fn below moves exactly the one strong ref its contract names, the user's
+        // method runs only inside the safe fn `call` (so an `unsafe fn` method is refused), and
+        // `raw_waker_vtable` returns a static holding `$t`'s own vtable.
         unsafe impl $crate::UnsafeWakeable for $t {
             unsafe fn wake(ptr: *const Self) {
+                // Not `unsafe`: naming an `unsafe fn` method fails here with E0133.
+                fn call(arc: ::std::sync::Arc<$t>) {
+                    arc.$wake_method();
+                }
                 // SAFETY: `ptr` owns one strong ref (trait contract); it is consumed here.
-                let arc = unsafe { ::std::sync::Arc::from_raw(ptr) };
-                arc.$wake_method();
+                call(unsafe { ::std::sync::Arc::from_raw(ptr) });
             }
 
             unsafe fn wake_by_ref(ptr: *const Self) {
-                // SAFETY: `ptr` points at a live Arc; ManuallyDrop leaves the caller's ref untouched.
-                let arc = ::std::mem::ManuallyDrop::new(unsafe { ::std::sync::Arc::from_raw(ptr) });
-                ::std::sync::Arc::clone(&*arc).$wake_method();
+                // SAFETY: `ptr` points at a live Arc (trait contract); `clone_ptr` takes one more
+                // ref and `wake` consumes that one, so the caller's ref is untouched.
+                unsafe { Self::wake(Self::clone_ptr(ptr)) }
             }
 
             unsafe fn clone_ptr(ptr: *const Self) -> *const Self {
@@ -137,6 +192,12 @@ macro_rules! derive_arc_unsafe_wakeable {
             unsafe fn drop_ptr(ptr: *const Self) {
                 // SAFETY: `ptr` owns one strong ref (trait contract); it is released here.
                 unsafe { ::std::sync::Arc::decrement_strong_count(ptr) };
+            }
+
+            fn raw_waker_vtable() -> &'static ::std::task::RawWakerVTable {
+                // One static per type: every waker of `$t` carries this one address.
+                static VTABLE: ::std::task::RawWakerVTable = $crate::RawWakerVTableOf::<$t>::VTABLE;
+                &VTABLE
             }
         }
     };
@@ -152,16 +213,13 @@ impl<T: UnsafeWakeable> RawWakerVTableOf<T> {
         RawWakerVTable::new(raw_clone::<T>, raw_wake::<T>, raw_wake_by_ref::<T>, raw_drop::<T>);
 }
 
-fn raw_waker_vtable<T: UnsafeWakeable>() -> &'static RawWakerVTable {
-    &RawWakerVTableOf::<T>::VTABLE
-}
-
 // SAFETY (all four): a RawWaker built by this crate carries `*const T` from `Arc::into_raw`
-// alongside `RawWakerVTableOf::<T>::VTABLE`, never another type's.
+// alongside `T::raw_waker_vtable()`, which holds these four functions for `T` (trait contract),
+// never another type's.
 unsafe fn raw_clone<T: UnsafeWakeable>(data: *const ()) -> RawWaker {
     // SAFETY: see above; the new ref belongs to the returned RawWaker.
     let ptr = unsafe { T::clone_ptr(data as *const T) };
-    RawWaker::new(ptr as *const (), raw_waker_vtable::<T>())
+    RawWaker::new(ptr as *const (), T::raw_waker_vtable())
 }
 
 unsafe fn raw_wake<T: UnsafeWakeable>(data: *const ()) {
@@ -181,8 +239,9 @@ unsafe fn raw_drop<T: UnsafeWakeable>(data: *const ()) {
 
 /// Declare a `'static` `RawWakerVTable` for a specific `UnsafeWakeable` type.
 ///
-/// Kept for code written against 0.1: [`waker_from_arc`] no longer takes a vtable, it builds
-/// `T`'s own. The static this declares is that same vtable.
+/// Kept for code written against 0.1: [`waker_from_arc`] no longer takes a vtable, it uses
+/// `T`'s own ([`UnsafeWakeable::raw_waker_vtable`]). The static this declares holds the same
+/// four functions, at its own address.
 ///
 /// ```
 /// use std::sync::Arc;
@@ -243,7 +302,7 @@ impl<T: UnsafeWakeable> Drop for SmartWakerPtr<T> {
 /// The `RawWaker` is inert until `Waker::from_raw`, which is where `ptr` must own a strong
 /// ref of an `Arc<T>`.
 pub fn raw_waker_from_ptr<T: UnsafeWakeable>(ptr: *const T) -> RawWaker {
-    RawWaker::new(ptr as *const (), raw_waker_vtable::<T>())
+    RawWaker::new(ptr as *const (), T::raw_waker_vtable())
 }
 
 /// Build a `Waker` from an `Arc<T>`; the waker owns that strong ref.

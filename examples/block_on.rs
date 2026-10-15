@@ -48,13 +48,14 @@ struct Ticks {
 }
 
 struct TickState {
+    ticks: u32,
     fired: u32,
     waker: Option<Waker>,
 }
 
 impl Ticks {
     fn start(ticks: u32, every: Duration) -> Self {
-        let shared = Arc::new(Mutex::new(TickState { fired: 0, waker: None }));
+        let shared = Arc::new(Mutex::new(TickState { ticks, fired: 0, waker: None }));
         let timer = shared.clone();
         thread::spawn(move || {
             for _ in 0..ticks {
@@ -75,7 +76,7 @@ impl Future for Ticks {
 
     fn poll(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<u32> {
         let mut state = self.shared.lock().unwrap();
-        if state.fired == 3 {
+        if state.fired == state.ticks {
             Poll::Ready(state.fired)
         } else {
             state.waker = Some(cx.waker().clone());
@@ -89,4 +90,33 @@ fn main() {
     println!("timer fired {fired} times; the waker woke the executor {wakes} times");
     assert_eq!(fired, 3);
     assert!(wakes >= 1);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    /// `block_on(Ticks::start(n, ..))` returns `n` for every `n`. `None` means it did not return
+    /// within 5s (it would hang forever).
+    #[test]
+    fn ticks_returns_its_own_count() {
+        let counts = [0, 1, 2, 3, 4, 7];
+        let results: Vec<_> = counts
+            .iter()
+            .map(|&ticks| {
+                let (done, result) = mpsc::channel();
+                thread::spawn(move || done.send(block_on(Ticks::start(ticks, Duration::from_millis(1))).0));
+                result
+            })
+            .collect();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let got: Vec<Option<u32>> = results
+            .iter()
+            .map(|result| result.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok())
+            .collect();
+        let want: Vec<Option<u32>> = counts.iter().map(|&ticks| Some(ticks)).collect();
+        assert_eq!(got, want);
+    }
 }

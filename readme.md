@@ -46,6 +46,10 @@ You promise that the `*const Self` used by the vtable obeys **`Arc::into_raw` / 
 - `drop_ptr` must balance exactly one strong ref
 - `wake` consumes the ref (like `Waker::wake`)
 - `wake_by_ref` must not consume the original ref
+- `raw_waker_vtable`, if you override it, returns a `'static` copy of `T`'s own vtable (the default)
+
+`derive_arc_unsafe_wakeable!(T, method)` keeps all of these for you. It calls `method` from a plain
+(not `unsafe`) fn, so the method must be safe: an `unsafe fn` is refused at compile time (E0133).
 
 This is **only about ownership and refcount correctness**, not scheduling.
 
@@ -68,7 +72,7 @@ This crate intentionally does not enforce a scheduler model — that’s your jo
 
 - `UnsafeWakeable` — wire your own type into `RawWakerVTable`
 - `derive_arc_unsafe_wakeable!` — convenience macro for the `Arc<T>` case
-- `waker_from_arc` — build a real `Waker` from `Arc<T>`; the vtable is built from `T`
+- `waker_from_arc` — build a real `Waker` from `Arc<T>`; the vtable is `T`'s own (`T::raw_waker_vtable()`)
 - `declare_raw_waker_vtable!` — a `'static` copy of that vtable (kept for 0.1 code)
 
 - `UnsafeWakeableTask` — “task object” contract: `poll/wake/drop_in_place`
@@ -85,7 +89,7 @@ Add the crate:
 
 ```toml
 [dependencies]
-waker_tables = "0.3"
+waker_tables = "0.4"
 ```
 
 ---
@@ -322,8 +326,17 @@ fn main() {
 ## Performance notes
 
 - `UnsafeWakeablePtr` is basically a manually-managed fat pointer: **two machine words**.
-- `UnsafeWakeableVTable` is a set of three function pointers: `poll/wake/drop`.
+- `UnsafeWakeableVTable` is five function pointers: `poll/wake/drop`, plus `type_id/type_name`,
+  which `RegisteredTask::new` uses for its type check.
 - Everything is designed for **fast dispatch** with predictable branches.
+
+```rust
+use std::mem::size_of;
+use waker_tables::{UnsafeWakeablePtr, UnsafeWakeableVTable};
+
+assert_eq!(size_of::<UnsafeWakeablePtr>(), 2 * size_of::<usize>());
+assert_eq!(size_of::<UnsafeWakeableVTable>(), 5 * size_of::<usize>());
+```
 
 If you benchmark, remember:
 - cold runs can include I/O/page-fault noise
@@ -336,7 +349,7 @@ If you benchmark, remember:
 
 - **Mixing pointer + vtable**: calling the wrong vtable for the wrong type is UB.  
   Use `RegisteredTask`: it refuses a key whose vtable is for another type. Wakers cannot mix:
-  `waker_from_arc` builds `T`'s own vtable.
+  `waker_from_arc` uses `T`'s own vtable.
 
 - **Freeing tasks**: a bare `UnsafeWakeablePtr` does not own its task; `drop_in_place` runs the task's
   cleanup hook but does not free it. `RegisteredTask` frees on drop.
@@ -345,6 +358,12 @@ If you benchmark, remember:
 
 - **RawWaker refcounts**: if you implement `UnsafeWakeable` manually, the *only* acceptable mental model is:  
   “every pointer is an `Arc<T>` raw pointer; clone increments; drop decrements.”
+
+- **`will_wake`**: `Waker::will_wake` compares vtable addresses. A type wired with
+  `derive_arc_unsafe_wakeable!` carries one `static` vtable, so a waker and its clones always
+  `will_wake` each other. A manual impl that keeps the default `raw_waker_vtable` gets a reference to
+  a constant, which an optimized build may copy, so there `will_wake` is best-effort and can be
+  `false` between a waker and its own clone.
 
 ---
 
@@ -361,6 +380,27 @@ If you are perfectly happy with:
 This crate is for people who want to own their runtime boundaries.
 
 ---
+
+## 0.4.0
+
+- `derive_arc_unsafe_wakeable!` no longer lets safe code call an `unsafe fn`. 0.3 called your method
+  inside the body of the `unsafe fn wake` it generated, so naming an `unsafe fn` method (your own, or
+  one reached through `Deref`, such as `Option::unwrap_unchecked`) compiled with no `unsafe` anywhere
+  in your code, and Miri reported Undefined Behavior. 0.4 calls the method from a plain fn, so that
+  is a compile error (E0133). A safe method works exactly as before.
+- A waker and its clones now carry one vtable address, so `will_wake` between them is `true` in
+  release builds too. In 0.3 the vtable was a constant, an optimized build could hold two copies of
+  it, and `cargo test --release` failed on `clone.will_wake(&waker)`. `UnsafeWakeable` has a new
+  provided method, `raw_waker_vtable()`; `derive_arc_unsafe_wakeable!` overrides it with one `static`
+  per type, and `waker_from_arc`, `raw_waker_from_ptr` and waker clones all use it. A manual impl
+  keeps the default (0.3's constant), so for it `will_wake` stays best-effort. CI now also runs
+  `cargo test --release`.
+- `derive_arc_unsafe_wakeable!` now needs a sized type. It accepted an unsized one before, but no
+  waker could be built from it.
+- The `block_on` example honors its tick count: `Ticks::start(n, ..)` returns `n`. In 0.3 its future
+  checked a literal 3, so 2 hung forever and 4 returned 3.
+- The README said `UnsafeWakeableVTable` is three function pointers; it is five, and a doctest now
+  checks both sizes.
 
 ## 0.3.0
 

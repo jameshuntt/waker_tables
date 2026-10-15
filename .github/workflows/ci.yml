@@ -21,6 +21,7 @@ jobs:
         with:
           components: clippy
       - run: cargo test --all-targets --locked
+      - run: cargo test --release --all-targets --locked
       - run: cargo test --doc
       - run: cargo clippy --all-targets -- -D warnings -W clippy::undocumented_unsafe_blocks
       - run: cargo doc --no-deps
