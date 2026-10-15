@@ -1,0 +1,13 @@
+[package]
+name = "proof-const-task-e5833df"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+waker_tables = { git = "https://github.com/jameshuntt/waker_tables", rev = "e5833df6eb61e216330e29f0327193fb295823b5" }
+
+[workspace]

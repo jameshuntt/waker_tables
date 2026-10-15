@@ -1,0 +1,10 @@
+[package]
+name = "proof-readme-examples-0-1-4"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+waker_tables = "=0.1.4"
+
+[workspace]

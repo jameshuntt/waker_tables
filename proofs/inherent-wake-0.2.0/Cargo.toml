@@ -1,0 +1,10 @@
+[package]
+name = "proof-inherent-wake-0-2-0"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+waker_tables = "=0.2.0"
+
+[workspace]

@@ -1,0 +1,10 @@
+[package]
+name = "proof-two-declares-0-4-0"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+waker_tables = { git = "https://github.com/jameshuntt/waker_tables", rev = "956a08d4b3c9220a5e5dba1c36fdf953e5badcfb" }
+
+[workspace]
