@@ -85,7 +85,7 @@ Add the crate:
 
 ```toml
 [dependencies]
-waker_tables = "0.2"
+waker_tables = "0.3"
 ```
 
 ---
@@ -362,12 +362,19 @@ This crate is for people who want to own their runtime boundaries.
 
 ---
 
+## 0.3.0
+
+- `UnsafeWakeableVTable`'s fields are private: build it only with `UnsafeWakeableVTable::of::<T>()`
+  or `derive_unsafe_wakeable_vtable!`. In 0.2 a vtable could be written by hand claiming one type while
+  holding another type's functions, which `RegisteredTask::new`'s check could not catch. `type_name()`
+  reads the name.
+
 ## 0.2.0
 
 - `waker_from_arc(arc)` takes no vtable: it builds `T`'s own, so a waker can never run another
   type's functions. `raw_waker_from_ptr(ptr)` likewise. `declare_raw_waker_vtable!` still compiles
   and declares that same vtable.
-- `UnsafeWakeableVTable` records its task type (`type_id`, `type_name`); build it with
+- `UnsafeWakeableVTable` records its task type; build it with
   `UnsafeWakeableVTable::of::<T>()` or `derive_unsafe_wakeable_vtable!`.
 - `RegisteredTask::new` panics on a key registered for another type, and `RegisteredTask` frees its
   task on drop (0.1 never freed it). Its fields are private: use `key()` and `ptr()`.

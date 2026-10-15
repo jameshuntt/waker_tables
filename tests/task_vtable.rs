@@ -256,5 +256,5 @@ fn re_registering_a_key_leaves_existing_tasks_on_their_vtable() {
 fn vtable_knows_its_type() {
     assert!(COUNTDOWN_VTABLE.is_for::<Countdown>());
     assert!(!COUNTDOWN_VTABLE.is_for::<Plain>());
-    assert_eq!((PLAIN_VTABLE.type_name)(), "task_vtable::Plain");
+    assert_eq!(PLAIN_VTABLE.type_name(), "task_vtable::Plain");
 }

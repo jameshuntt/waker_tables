@@ -291,18 +291,28 @@ pub unsafe trait UnsafeWakeableTask {
 /// Function-pointer vtable for `UnsafeWakeableTask`.
 ///
 /// Build it with [`UnsafeWakeableVTable::of`] (or [`derive_unsafe_wakeable_vtable!`]): it
-/// records the task type, and [`RegisteredTask::new`] checks it.
+/// records the task type, and [`RegisteredTask::new`] checks it. The fields are private, so a
+/// vtable cannot claim one type while holding another type's functions:
+///
+/// ```compile_fail,E0451
+/// # use waker_tables::UnsafeWakeableVTable;
+/// struct A;
+/// struct B;
+/// # unsafe impl waker_tables::UnsafeWakeableTask for A { unsafe fn poll(&mut self) -> std::task::Poll<()> { std::task::Poll::Ready(()) } unsafe fn wake(&self) {} unsafe fn drop_in_place(&mut self) {} }
+/// # unsafe impl waker_tables::UnsafeWakeableTask for B { unsafe fn poll(&mut self) -> std::task::Poll<()> { std::task::Poll::Ready(()) } unsafe fn wake(&self) {} unsafe fn drop_in_place(&mut self) {} }
+/// fn a_type_id() -> std::any::TypeId { std::any::TypeId::of::<A>() }
+/// // B's functions under A's type: refused, the fields are private.
+/// static LIAR: UnsafeWakeableVTable = UnsafeWakeableVTable {
+///     type_id: a_type_id,
+///     ..UnsafeWakeableVTable::of::<B>()
+/// };
+/// ```
 pub struct UnsafeWakeableVTable {
-    /// Calls the task's `poll`.
-    pub poll_fn: unsafe fn(*mut ()) -> Poll<()>,
-    /// Calls the task's `wake`.
-    pub wake_fn: unsafe fn(*const ()),
-    /// Calls the task's `drop_in_place`.
-    pub drop_fn: unsafe fn(*mut ()),
-    /// The `TypeId` of the task type the fns read `data` as.
-    pub type_id: fn() -> TypeId,
-    /// The task type's name, for messages.
-    pub type_name: fn() -> &'static str,
+    poll_fn: unsafe fn(*mut ()) -> Poll<()>,
+    wake_fn: unsafe fn(*const ()),
+    drop_fn: unsafe fn(*mut ()),
+    type_id: fn() -> TypeId,
+    type_name: fn() -> &'static str,
 }
 
 unsafe fn task_poll<T: UnsafeWakeableTask>(data: *mut ()) -> Poll<()> {
@@ -335,6 +345,11 @@ impl UnsafeWakeableVTable {
     /// Whether this vtable reads its data as `T`.
     pub fn is_for<T: 'static>(&self) -> bool {
         (self.type_id)() == TypeId::of::<T>()
+    }
+
+    /// The name of the task type this vtable was built for.
+    pub fn type_name(&self) -> &'static str {
+        (self.type_name)()
     }
 }
 
