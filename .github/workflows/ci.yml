@@ -20,7 +20,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo test --all-targets
+      - run: cargo test --all-targets --locked
       - run: cargo test --doc
       - run: cargo clippy --all-targets -- -D warnings -W clippy::undocumented_unsafe_blocks
       - run: cargo doc --no-deps
@@ -35,7 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
-      - run: cargo test --all-targets
+      - run: cargo test --all-targets --locked
 
   miri:
     runs-on: ubuntu-latest
