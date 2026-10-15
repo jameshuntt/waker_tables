@@ -75,7 +75,9 @@ check; its methods are `unsafe` for that reason.
 Two `unsafe` constructors do what 0.1 allowed: `UnsafeWakeableVTable::from_raw_parts::<T>(poll, wake, drop)`
 builds a vtable by hand and records it as `T`'s, and `RegisteredTask::from_raw_parts(key, ptr)` wraps a
 task over memory you own, with no type check. `RegisteredTask` never frees such a task, and `into_raw_parts` hands any
-task's pointer back without freeing it.
+task's pointer back without freeing it; `owns_its_task()`, read before that call, says whether the pointer is a `Box<T>`
+you must then free. Which memory a task may sit in is written once, under "The data pointer" in `UnsafeWakeablePtr`'s
+docs.
 
 This crate intentionally does not enforce a scheduler model — that’s your job.
 
@@ -96,7 +98,7 @@ This crate intentionally does not enforce a scheduler model — that’s your jo
 - `UnsafeWakeablePtr` — thin “fat pointer” pair (`data + &'static vtable`)
 - `VTableRegistry` + `VTableKey` — segment/kind/version mapping to vtables
 - `RegisteredTask` — owns a boxed task: checks its vtable's type, runs it, frees it on drop;
-  `from_raw_parts` (`unsafe`) and `into_raw_parts` for memory you own
+  `from_raw_parts` (`const unsafe`) and `into_raw_parts` for memory you own; `owns_its_task` tells the two apart
 
 ---
 
@@ -373,7 +375,9 @@ If you benchmark, remember:
 
 - **Freeing tasks**: a bare `UnsafeWakeablePtr` does not own its task; `drop_in_place` runs the task's
   cleanup hook but does not free it. `RegisteredTask` frees a task from `new` on drop, never one from
-  `from_raw_parts`; after `into_raw_parts` the task is yours to free (its result is `#[must_use]`).
+  `from_raw_parts`, and `owns_its_task()` says which a task is. Read it before `into_raw_parts`: if it
+  was `true`, the `Box<T>` is now yours to free (the result is `#[must_use]`); if `false`, the memory
+  belongs to whoever called `from_raw_parts`, and only they free it.
 
 - **Polling concurrently**: if your task is not internally synchronized, you must ensure exclusive polling (just like futures).
 
@@ -439,37 +443,50 @@ which was never published. Line numbers below are in the 0.4.0 tree.
   The fields stay private. `UnsafeWakeableVTable::from_raw_parts::<T>(poll_fn, wake_fn, drop_fn)` is a
   `const unsafe fn` that works in a `static` and records `T` as the vtable's type, and `poll_fn()`,
   `wake_fn()`, `drop_fn()` read the functions back (safe: calling them needs `unsafe`) (src/lib.rs lines
-  584–674). It is `unsafe` because `RegisteredTask::new` trusts the recorded type: a vtable safe code
+  584–677). It is `unsafe` because `RegisteredTask::new` trusts the recorded type: a vtable safe code
   built by hand could record `A` with `B`'s functions, and `new` would accept a `Box<A>` for it. With
   such a vtable the function that runs is the one passed in, so the `# Safety` sections of `poll`,
   `wake` and `drop_in_place` on `UnsafeWakeablePtr` and `RegisteredTask` name the contract of the
   vtable's function: `T`'s `UnsafeWakeableTask` method for a vtable from `of` or
   `derive_unsafe_wakeable_vtable!`, the hand-built function's own for one from `from_raw_parts`
-  (src/lib.rs lines 707–748 and 1117–1155). Tests: tests/task_vtable_parts.rs,
+  (src/lib.rs lines 732–775 and 1164–1203). Tests: tests/task_vtable_parts.rs,
   tests/safety_contracts.rs.
 - **A `RegisteredTask` over memory you own, and its pointer taken back out.** In 0.1.4 `key` and `ptr`
-  were `pub`, a task could be built as `RegisteredTask { key, ptr }` over any memory, `ptr` could be
-  moved out, and nothing was freed. 0.2.0 made the fields private and made `RegisteredTask` free its
-  task. Now `unsafe fn RegisteredTask::from_raw_parts(key, ptr)` builds one that `RegisteredTask`'s
-  `Drop` never frees, and `fn into_raw_parts(self) -> (VTableKey, UnsafeWakeablePtr)` hands the pointer
-  back without freeing it; for a task made by `new`, you then own the `Box<T>` and must free it, and
-  `into_raw_parts` is `#[must_use]` so that throwing the result away is warned about (src/lib.rs lines
-  932–954 and 987–1105). `from_raw_parts` is `unsafe` because `poll`, `wake` and `drop_in_place`
-  trust the pointer and vtable to match; with `pub` fields safe code could pair a task with another
-  type's vtable. Its `# Safety` asks for a pointer valid for reads and writes (from `Box::into_raw` or
-  `&mut x as *mut _`, never cast from `&x`), since `poll` and `drop_in_place` write through it. `new`
-  and its type check are unchanged. Tests: tests/registered_task_parts.rs, tests/safety_contracts.rs.
-- **A `#[repr(transparent)]` wrapper under its inner type's key.** 0.1.4's `RegisteredTask::new` did
-  not check the type, so such a wrapper ran under its inner type's key; 0.2.0 added the check. `new`
-  keeps it, and `from_raw_parts` above takes such a task: its `# Safety` allows the vtable's type or a
-  `#[repr(transparent)]` wrapper of it, whose memory always holds a valid value of that type. Two types
-  that only share a size and alignment are not enough: an `A(u8)` holding 2, read as a `B(bool)`, is
-  Undefined Behavior. Tests: tests/same_layout_key.rs, tests/safety_contracts.rs.
+  were `pub`, a task could be built as `RegisteredTask { key, ptr }` over any memory, also in a `const`,
+  `ptr` could be moved out, and nothing was freed. 0.2.0 made the fields private and made
+  `RegisteredTask` free its task. Now `const unsafe fn RegisteredTask::from_raw_parts(key, ptr)` builds
+  one that `RegisteredTask`'s `Drop` never frees; it works in a `const`, and a `const` task fills a
+  table as `[TASK; N]`. `fn into_raw_parts(self) -> (VTableKey, UnsafeWakeablePtr)` hands the pointer
+  back without freeing it. Its result does not say who owns the memory, so `fn owns_its_task(&self) ->
+  bool`, read before that call, does: `true` for a task made by `new`, whose `Box<T>` you then own and
+  must free, `false` for one made by `from_raw_parts`, whose memory belongs to whoever called it. The docs of
+  `into_raw_parts` and its `#[must_use]` text say to check it first (src/lib.rs lines 960–982 and
+  1015–1151). `from_raw_parts` is `unsafe` because `poll`, `wake` and `drop_in_place` trust the pointer
+  and vtable to match; with `pub` fields safe code could pair a task with another type's vtable. Its
+  `# Safety` asks for a pointer valid for reads and writes as the type the vtable's functions read it
+  as (from `Box::into_raw` or `&mut x as *mut _`, never derived from `&x`), since `poll` and
+  `drop_in_place` write through it. `new` and its type check are unchanged. Tests:
+  tests/registered_task_parts.rs, tests/owns_its_task.rs, tests/const_registered_task.rs,
+  tests/safety_contracts.rs.
+- **A task under the key of the type it starts with.** 0.1.4's `RegisteredTask::new` did not check
+  the type, so a `#[repr(transparent)]` wrapper ran under its inner type's key, and a `#[repr(C)]` task
+  whose first field is a header type ran under the header's key, several task types sharing the
+  header's vtable. 0.2.0 added the check. `new` keeps it, and `from_raw_parts` above takes such tasks.
+  The rule is written once, under "The data pointer" in `UnsafeWakeablePtr`'s docs (src/lib.rs lines
+  703–723). The `# Safety` sections of `RegisteredTask::from_raw_parts`, of `poll` and `wake` on
+  `UnsafeWakeablePtr` (`drop_in_place` is as `poll`), and of `UnsafeWakeableVTable::from_raw_parts` state
+  it and link there: the memory is valid for reads and writes as the type the vtable's functions read
+  it as.
+  That memory may be that type itself, a `#[repr(transparent)]` wrapper of it, or a `#[repr(C)]` struct
+  whose first field is that type. Two types that only share a size and alignment are not enough: an
+  `A(u8)` holding 2, read as a `B(bool)`, is Undefined Behavior. Neither is a struct without
+  `#[repr(C)]`, whose first field need not be at its start. Tests: tests/same_layout_key.rs,
+  tests/repr_c_header.rs, tests/safety_contracts.rs.
 
 One change since 0.1.4 stays: `derive_unsafe_wakeable_vtable!` calls the trait's `poll`, `wake` and
 `drop_in_place`, never an inherent method of the same name. 0.1.4's macro wrote `(*ptr).poll()`, and
 Rust picks an inherent `poll` over the trait's, so a type with both ran the inherent one through its
-vtable. 0.2.0 fixed that; it is now documented on the macro, with a doctest (src/lib.rs lines 764–793).
+vtable. 0.2.0 fixed that; it is now documented on the macro, with a doctest (src/lib.rs lines 791–820).
 
 ## 0.3.1
 

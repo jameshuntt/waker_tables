@@ -622,11 +622,14 @@ impl UnsafeWakeableVTable {
     ///
     /// # Safety
     ///
-    /// Each function reads its data pointer as a live `T`, under the access the vtable's callers
+    /// Each function reads its data pointer as a `T`, under the access the vtable's callers
     /// ([`UnsafeWakeablePtr`] and [`RegisteredTask`]) promise: `poll_fn` and `drop_fn` get a pointer
-    /// to a live `T`, valid for reads and writes, that nothing else uses during the call; `wake_fn`
-    /// gets a pointer to a live `T`, valid for reads. Beyond that, each function may rely only on its
-    /// own documented contract: the `# Safety` sections of the `unsafe` `poll`, `wake` and
+    /// valid for reads and writes as a `T`, that nothing else uses during the call; `wake_fn` gets a
+    /// pointer valid for reads as a `T`. The memory there holds a valid `T`, but it may be a larger
+    /// value that starts with one, such as a `#[repr(C)]` struct whose first field is a `T`
+    /// ([the data pointer](UnsafeWakeablePtr#the-data-pointer)), so a function touches only the `T`
+    /// at the pointer unless its own contract says more. Beyond that, each function may rely only
+    /// on its own documented contract: the `# Safety` sections of the `unsafe` `poll`, `wake` and
     /// `drop_in_place` methods name the vtable's function's contract, and their callers uphold it.
     ///
     /// Safe code cannot build a vtable by hand: calling this outside `unsafe` is refused, and the
@@ -696,6 +699,28 @@ impl fmt::Debug for UnsafeWakeableVTable {
 ///
 /// This is the "fat pointer" equivalent you can pass around cheaply. It does not own the
 /// task; [`RegisteredTask`] does.
+///
+/// # The data pointer
+///
+/// `vtable`'s functions read `data` as one type: the `T` of [`UnsafeWakeableVTable::of`] or
+/// [`UnsafeWakeableVTable::from_raw_parts`]. The `unsafe` functions that run them
+/// ([`poll`](Self::poll), [`wake`](Self::wake), [`drop_in_place`](Self::drop_in_place) and
+/// [`RegisteredTask::from_raw_parts`]) ask for `data` to be valid for reads, and for `poll` and
+/// `drop_in_place` also for writes, as that type: not null, aligned for it, and holding a valid
+/// value of it. Memory that meets this:
+///
+/// - that type itself;
+/// - a `#[repr(transparent)]` wrapper of it;
+/// - a `#[repr(C)]` struct whose first field is that type. The functions of a vtable from `of`
+///   touch only that field, so several task types that start with it can share its vtable and key.
+///
+/// Memory that does not:
+///
+/// - a type that only has the same size and alignment: an `A(u8)` holding 2, read as a `B(bool)`,
+///   is Undefined Behavior;
+/// - a struct without `#[repr(C)]`, whose first field need not be at its start;
+/// - for writes, a pointer derived from a shared reference `&x`. Take it from `Box::into_raw` or
+///   `&mut x as *mut _`.
 #[repr(C)]
 pub struct UnsafeWakeablePtr {
     /// The task.
@@ -708,8 +733,9 @@ impl UnsafeWakeablePtr {
     /// Runs the vtable's `poll` function on `self.data`.
     ///
     /// # Safety
-    /// `self.data` points at a live task of the type `self.vtable` was built for, valid for reads
-    /// and writes, and nothing else uses it during the call. Plus the contract of the vtable's `poll`
+    /// `self.data` is valid for reads and writes as the type `self.vtable`'s functions read it as
+    /// ([the data pointer](UnsafeWakeablePtr#the-data-pointer) lists the memory that qualifies), and
+    /// nothing else uses it during the call. Plus the contract of the vtable's `poll`
     /// function ([`UnsafeWakeableVTable::poll_fn`]): for a vtable from [`UnsafeWakeableVTable::of`]
     /// or [`derive_unsafe_wakeable_vtable!`], that is `T`'s [`UnsafeWakeableTask::poll`]; for one
     /// from [`UnsafeWakeableVTable::from_raw_parts`], it is the contract of the function passed as
@@ -722,7 +748,8 @@ impl UnsafeWakeablePtr {
     /// Runs the vtable's `wake` function on `self.data`.
     ///
     /// # Safety
-    /// `self.data` points at a live task of the type `self.vtable` was built for, valid for reads.
+    /// `self.data` is valid for reads as the type `self.vtable`'s functions read it as
+    /// ([the data pointer](UnsafeWakeablePtr#the-data-pointer) lists the memory that qualifies).
     /// Plus the contract of the vtable's `wake` function ([`UnsafeWakeableVTable::wake_fn`]): for a
     /// vtable from [`UnsafeWakeableVTable::of`] or [`derive_unsafe_wakeable_vtable!`], that is `T`'s
     /// [`UnsafeWakeableTask::wake`]; for one from [`UnsafeWakeableVTable::from_raw_parts`], it is
@@ -920,8 +947,9 @@ pub static GLOBAL_VTABLE_REGISTRY: LazyLock<VTableRegistry> = LazyLock::new(VTab
 ///
 /// [`new`](Self::new) checks the vtable against the task's type, and the task is freed when
 /// this is dropped. [`from_raw_parts`](Self::from_raw_parts) (`unsafe`) wraps a task over memory
-/// the caller owns, which is never freed here, and [`into_raw_parts`](Self::into_raw_parts) hands
-/// the pointer back. The fields are private so the pointer, vtable and free fn stay together:
+/// the caller owns, which is never freed here; [`owns_its_task`](Self::owns_its_task) says which
+/// of the two a task is. [`into_raw_parts`](Self::into_raw_parts) hands the pointer back. The
+/// fields are private so the pointer, vtable and free fn stay together:
 ///
 /// ```compile_fail,E0616
 /// # use waker_tables::RegisteredTask;
@@ -986,8 +1014,10 @@ impl RegisteredTask {
 
     /// A task over memory the caller owns (0.1 wrote this as the struct literal
     /// `RegisteredTask { key, ptr }`). `key` is recorded as given: it is not looked up or checked.
-    /// `RegisteredTask`'s `Drop` never frees this task; the caller frees it, after this is dropped
-    /// or after [`into_raw_parts`](Self::into_raw_parts) hands the pointer back.
+    /// `RegisteredTask`'s `Drop` never frees this task ([`owns_its_task`](Self::owns_its_task) is
+    /// `false`); the caller frees it, after this is dropped or after
+    /// [`into_raw_parts`](Self::into_raw_parts) hands the pointer back. It is a `const fn`, since
+    /// the struct literal worked in a `const`: a `const` task can fill an array as `[TASK; N]`.
     ///
     /// ```
     /// use std::task::Poll;
@@ -1015,12 +1045,11 @@ impl RegisteredTask {
     ///
     /// # Safety
     ///
-    /// `ptr.data` points at a live task that `ptr.vtable`'s functions may read as the type the
-    /// vtable was built for (that type, or a `#[repr(transparent)]` wrapper of it, so that the
-    /// memory always holds a valid value of that type). `ptr.data` is valid for reads and writes of
-    /// that type: for example from `Box::into_raw` or `&mut x as *mut _`, never cast from a shared
-    /// reference `&x`. It stays valid for as long as the `RegisteredTask` exists, and while a
-    /// `poll`, `wake` or `drop_in_place` call on it runs, nothing else uses the task.
+    /// `ptr.data` is valid for reads and writes as the type `ptr.vtable`'s functions read it as,
+    /// for as long as the `RegisteredTask` exists, and is never derived from a shared reference
+    /// `&x`. [The data pointer](UnsafeWakeablePtr#the-data-pointer) lists the memory that meets
+    /// this and the memory that does not. While a `poll`, `wake` or `drop_in_place` call on the
+    /// task runs, nothing else uses it.
     ///
     /// Safe code still cannot pair a task with another type's vtable: calling this outside
     /// `unsafe` is refused, and [`new`](Self::new) panics on a key registered for another type.
@@ -1045,15 +1074,29 @@ impl RegisteredTask {
     /// // An A under B's key: panics ("vtable for key ... is for B, not A").
     /// let _ = RegisteredTask::new(Box::new(A), key);
     /// ```
-    pub unsafe fn from_raw_parts(key: VTableKey, ptr: UnsafeWakeablePtr) -> Self {
+    pub const unsafe fn from_raw_parts(key: VTableKey, ptr: UnsafeWakeablePtr) -> Self {
         Self { key, ptr, free: None }
+    }
+
+    /// Whether this `RegisteredTask` owns its task and frees it when dropped: `true` for one made
+    /// by [`new`](Self::new), which boxed the task, and `false` for one made by
+    /// [`from_raw_parts`](Self::from_raw_parts), whose memory the caller owns.
+    ///
+    /// Check it before [`into_raw_parts`](Self::into_raw_parts), whose result does not say: code
+    /// that takes a `RegisteredTask` it did not build learns here whether the pointer it gets back
+    /// is a `Box<T>` it must free or memory it must leave alone.
+    pub fn owns_its_task(&self) -> bool {
+        self.free.is_some()
     }
 
     /// Hand back the key and the task pointer without freeing the task.
     ///
-    /// For a task made by [`new`](Self::new), the caller now owns the `Box<T>` and must free it,
-    /// with `drop(unsafe { Box::from_raw(ptr.data as *mut T) })`, or it leaks. For one made by
-    /// [`from_raw_parts`](Self::from_raw_parts), the memory was the caller's all along.
+    /// Check [`owns_its_task`](Self::owns_its_task) first: the result does not say who owns the
+    /// memory. If it was `true` (a task made by [`new`](Self::new)), the caller now owns the
+    /// `Box<T>` and must free it, with `drop(unsafe { Box::from_raw(ptr.data as *mut T) })`, or it
+    /// leaks. If it was `false` (a task made by [`from_raw_parts`](Self::from_raw_parts)), the
+    /// memory belongs to whoever called `from_raw_parts`, and only they free it: freeing it here
+    /// as a `Box<T>` could free stack memory, or free it a second time.
     ///
     /// ```
     /// use std::task::Poll;
@@ -1071,9 +1114,13 @@ impl RegisteredTask {
     /// GLOBAL_VTABLE_REGISTRY.register(key, &STEPS_VTABLE);
     ///
     /// let task = RegisteredTask::new(Box::new(Steps { polls: 0 }), key);
+    /// let owned = task.owns_its_task(); // first: the parts do not say
     /// let (_, ptr) = task.into_raw_parts();
-    /// // SAFETY: `new` boxed a Steps, and the caller now owns that Box; it is freed once, here.
-    /// drop(unsafe { Box::from_raw(ptr.data as *mut Steps) });
+    /// if owned {
+    ///     // SAFETY: `new` boxed a Steps, and the caller now owns that Box; it is freed once, here.
+    ///     drop(unsafe { Box::from_raw(ptr.data as *mut Steps) });
+    /// }
+    /// # assert!(owned);
     /// ```
     ///
     /// Throwing the result away is warned about (`#[must_use]`), since a task made by `new` would
@@ -1095,7 +1142,7 @@ impl RegisteredTask {
     /// let task = RegisteredTask::new(Box::new(Steps { polls: 0 }), key);
     /// task.into_raw_parts(); // unused_must_use: the Box leaks
     /// ```
-    #[must_use = "a task made by `new` leaks unless `ptr.data` is freed as Box<T>"]
+    #[must_use = "check owns_its_task() before this call: if it was true, `ptr.data` must be freed as Box<T> or the task leaks"]
     pub fn into_raw_parts(self) -> (VTableKey, UnsafeWakeablePtr) {
         let this = ManuallyDrop::new(self);
         // SAFETY: `this` is never dropped, so the `ptr` read out here is the only copy left in use,
@@ -1123,9 +1170,10 @@ impl RegisteredTask {
     /// contract of the function passed as `poll_fn`.
     pub unsafe fn poll(&mut self) -> Poll<()> {
         // SAFETY: the vtable is `T`'s (checked in `new`) and the task is a live `Box<T>` until
-        // `Drop`, valid for reads and writes, or the caller of `from_raw_parts` promised all of
-        // that; `&mut self` makes the access exclusive (or `from_raw_parts`' caller promised nothing
-        // else uses it); the vtable function's own contract is the caller's.
+        // `Drop`, valid for reads and writes, or the caller of `from_raw_parts` promised a pointer
+        // valid for reads and writes as the vtable's type; `&mut self` makes the access exclusive
+        // (or `from_raw_parts`' caller promised nothing else uses it); the vtable function's own
+        // contract is the caller's.
         unsafe { self.ptr.poll() }
     }
 
