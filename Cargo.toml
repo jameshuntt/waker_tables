@@ -12,3 +12,6 @@ repository = "https://github.com/jameshuntt/waker_tables"
 readme = "readme.md"
 
 [dependencies]
+
+[dev-dependencies]
+uh-tom-mick = "0.1"

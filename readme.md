@@ -378,6 +378,7 @@ This crate is for people who want to own their runtime boundaries.
 ```bash
 cargo run --example block_on     # a whole executor on waker_from_arc, woken by a timer thread
 cargo run --example task_table   # a round-robin table of RegisteredTasks of two types
+cargo run --example admission_executor  # five jobs, at most two in flight, gated by uh-tom-mick's AtomicAdmission
 ```
 
 ## Testing
