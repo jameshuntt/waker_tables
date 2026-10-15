@@ -381,6 +381,16 @@ This crate is for people who want to own their runtime boundaries.
 
 ---
 
+## 0.3.2
+
+- `derive_arc_unsafe_wakeable!`'s generated `wake_by_ref` called `Self::wake(Self::clone_ptr(ptr))`. A
+  `Self::` path picks a type's own function before the trait's, so a type with its own safe
+  `fn clone_ptr(p: *const Self) -> *const Self` had that function used in place of the trait's: the
+  refcount went down on every `wake_by_ref`, and Miri reports a use-after-free in a program with no
+  `unsafe`. A wake method named `wake`, which 0.1.4 accepted, did not compile. The call now names the
+  trait (`<Self as UnsafeWakeable>::...`). This came in with 0.3.1's own fix.
+  `tests/inherent_names.rs` covers both cases and runs under Miri in CI.
+
 ## 0.3.1
 
 - `derive_arc_unsafe_wakeable!` no longer lets safe code call an `unsafe fn`. 0.3.0 called your method
