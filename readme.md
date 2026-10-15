@@ -51,6 +51,12 @@ You promise that the `*const Self` used by the vtable obeys **`Arc::into_raw` / 
 `derive_arc_unsafe_wakeable!(T, method)` keeps all of these for you. It calls `method` from a plain
 (not `unsafe`) fn, so the method must be safe: an `unsafe fn` is refused at compile time (E0133).
 
+`waker_from_arc` always uses `T`'s own vtable. To choose one per waker, as 0.1's
+`waker_from_arc(arc, &VTABLE)` did, call `unsafe fn waker_from_arc_with_vtable(arc, &VTABLE)` (or
+`raw_waker_from_ptr_with_vtable`). You promise the vtable reads the data pointer as `T`'s `Arc` by the
+rules above, and that its clone returns a `RawWaker` whose vtable does too.
+`declare_raw_waker_vtable!(T, NAME)` declares such a vtable.
+
 This is **only about ownership and refcount correctness**, not scheduling.
 
 ### 2) `UnsafeWakeableTask` (manual task vtable)
@@ -64,6 +70,11 @@ You promise that:
 `RegisteredTask::new` refuses a key registered for another type. A bare `UnsafeWakeablePtr` does not
 check; its methods are `unsafe` for that reason.
 
+Two `unsafe` constructors do what 0.1 allowed: `UnsafeWakeableVTable::from_raw_parts::<T>(poll, wake, drop)`
+builds a vtable by hand and records it as `T`'s, and `RegisteredTask::from_raw_parts(key, ptr)` wraps a
+task over memory you own, with no type check. `RegisteredTask` never frees such a task, and `into_raw_parts` hands any
+task's pointer back without freeing it.
+
 This crate intentionally does not enforce a scheduler model — that’s your job.
 
 ---
@@ -73,13 +84,16 @@ This crate intentionally does not enforce a scheduler model — that’s your jo
 - `UnsafeWakeable` — wire your own type into `RawWakerVTable`
 - `derive_arc_unsafe_wakeable!` — convenience macro for the `Arc<T>` case
 - `waker_from_arc` — build a real `Waker` from `Arc<T>`; the vtable is `T`'s own (`T::raw_waker_vtable()`)
-- `declare_raw_waker_vtable!` — a `'static` copy of that vtable (kept for 0.1 code)
+- `waker_from_arc_with_vtable` / `raw_waker_from_ptr_with_vtable` — `unsafe`: the same, with a vtable you choose
+- `declare_raw_waker_vtable!` — a `'static` vtable for `T` whose clones stay on it (0.1's macro)
 
 - `UnsafeWakeableTask` — “task object” contract: `poll/wake/drop_in_place`
 - `derive_unsafe_wakeable_vtable!` — generate a `'static` function-pointer vtable
+- `UnsafeWakeableVTable::from_raw_parts` — `unsafe`: build one by hand; `poll_fn()`, `wake_fn()`, `drop_fn()` read it
 - `UnsafeWakeablePtr` — thin “fat pointer” pair (`data + &'static vtable`)
 - `VTableRegistry` + `VTableKey` — segment/kind/version mapping to vtables
-- `RegisteredTask` — owns a boxed task: checks its vtable's type, runs it, frees it on drop
+- `RegisteredTask` — owns a boxed task: checks its vtable's type, runs it, frees it on drop;
+  `from_raw_parts` (`unsafe`) and `into_raw_parts` for memory you own
 
 ---
 
@@ -348,11 +362,13 @@ If you benchmark, remember:
 ## Common pitfalls
 
 - **Mixing pointer + vtable**: calling the wrong vtable for the wrong type is UB.  
-  Use `RegisteredTask`: it refuses a key whose vtable is for another type. Wakers cannot mix:
-  `waker_from_arc` uses `T`'s own vtable.
+  Use `RegisteredTask::new`: it refuses a key whose vtable is for another type
+  (`RegisteredTask::from_raw_parts` is `unsafe` and does not check). From safe code wakers cannot
+  mix: `waker_from_arc` uses `T`'s own vtable, and the `_with_vtable` functions are `unsafe`.
 
 - **Freeing tasks**: a bare `UnsafeWakeablePtr` does not own its task; `drop_in_place` runs the task's
-  cleanup hook but does not free it. `RegisteredTask` frees on drop.
+  cleanup hook but does not free it. `RegisteredTask` frees a task from `new` on drop, never one from
+  `from_raw_parts`; after `into_raw_parts` the task is yours to free.
 
 - **Polling concurrently**: if your task is not internally synchronized, you must ensure exclusive polling (just like futures).
 
@@ -363,7 +379,8 @@ If you benchmark, remember:
   `derive_arc_unsafe_wakeable!` carries one `static` vtable, so a waker and its clones always
   `will_wake` each other. A manual impl that keeps the default `raw_waker_vtable` gets a reference to
   a constant, which an optimized build may copy, so there `will_wake` is best-effort and can be
-  `false` between a waker and its own clone.
+  `false` between a waker and its own clone. A waker built on a `declare_raw_waker_vtable!` static
+  keeps that static through every clone.
 
 ---
 
@@ -380,6 +397,58 @@ If you are perfectly happy with:
 This crate is for people who want to own their runtime boundaries.
 
 ---
+
+## 0.3.2
+
+0.3.2 puts back five things 0.1.4 could do. Claude's earlier releases of this crate (0.2.0 and 0.3.0)
+took them out, and none of them had to go. Each one whose 0.1.4 form let safe code cause Undefined
+Behavior comes back as an `unsafe fn`, and its `# Safety` section says what the caller must guarantee.
+Safe code still cannot reach that Undefined Behavior: doctests show the compiler refusing it. Every
+safe function and type of 0.3.1 is unchanged; `declare_raw_waker_vtable!` changes as described below.
+Line numbers below are in the 0.3.2 tree.
+
+- **A vtable chosen per waker.** 0.1.4 had `waker_from_arc(arc, &VTABLE)` and
+  `raw_waker_from_ptr(ptr, &VTABLE)`, both safe; 0.2.0 dropped the vtable argument. Now
+  `unsafe fn waker_from_arc_with_vtable(arc, &VTABLE)` and
+  `unsafe fn raw_waker_from_ptr_with_vtable(ptr, &VTABLE)` (src/lib.rs lines 377–479). They are
+  `unsafe` because in 0.1.4 safe code could pass `B`'s vtable with an `Arc<A>`, and `B`'s functions then
+  read an `A` as a `B`. Tests: tests/waker_with_vtable.rs.
+- **`declare_raw_waker_vtable!` as in 0.1.4** (src/lib.rs lines 244–325). The static's clone returns a
+  `RawWaker` on that same static, so a waker built on it keeps it through `Waker::clone` and `Context`
+  clones, and `will_wake` holds between them. From 0.2.0 to 0.3.1 the static's clone moved the waker to
+  the type's own vtable, a different static. The four helper fns `__waker_clone`, `__waker_wake`,
+  `__waker_wake_by_ref` and `__waker_drop` are back at the call site with 0.1.4's names and signatures,
+  so the macro can again be used only once per module (0.3.1 allowed more), and its static no longer
+  compares equal to `T::raw_waker_vtable()`. Declaring it is safe; a waker on it needs the `unsafe`
+  functions above, or `Waker::from_raw`. Tests: tests/declared_vtable.rs (line 46 is the clone test),
+  tests/declared_vtable_helpers.rs.
+- **Task vtables built by hand, and read.** 0.1.4's `UnsafeWakeableVTable` was a struct literal with `pub`
+  fields `poll_fn`, `wake_fn`, `drop_fn`; 0.2.0 added type fields and 0.3.0 made all of them private.
+  The fields stay private. `UnsafeWakeableVTable::from_raw_parts::<T>(poll_fn, wake_fn, drop_fn)` is a
+  `const unsafe fn` that works in a `static` and records `T` as the vtable's type, and `poll_fn()`,
+  `wake_fn()`, `drop_fn()` read the functions back (safe: calling them needs `unsafe`) (src/lib.rs lines
+  570–659). It is `unsafe` because `RegisteredTask::new` trusts the recorded type: a vtable safe code
+  built by hand could record `A` with `B`'s functions, and `new` would accept a `Box<A>` for it. Tests:
+  tests/task_vtable_parts.rs.
+- **A `RegisteredTask` over memory you own, and its pointer taken back out.** In 0.1.4 `key` and `ptr`
+  were `pub`, a task could be built as `RegisteredTask { key, ptr }` over any memory, `ptr` could be
+  moved out, and nothing was freed. 0.2.0 made the fields private and made `RegisteredTask` free its
+  task. Now `unsafe fn RegisteredTask::from_raw_parts(key, ptr)` builds one that `RegisteredTask`'s
+  `Drop` never frees, and `fn into_raw_parts(self) -> (VTableKey, UnsafeWakeablePtr)` hands the pointer
+  back without freeing it; for a task made by `new`, you then own the `Box<T>` and must free it
+  (src/lib.rs lines 901–923 and 956–1031). `from_raw_parts` is `unsafe` because `poll`, `wake` and
+  `drop_in_place` trust the pointer and vtable to match; with `pub` fields safe code could pair a task
+  with another type's vtable. `new` and its type check are unchanged. Tests:
+  tests/registered_task_parts.rs.
+- **A same-layout type under another type's key.** 0.1.4's `RegisteredTask::new` did not check the type,
+  so a `#[repr(transparent)]` wrapper ran under its inner type's key; 0.2.0 added the check. `new`
+  keeps it, and `from_raw_parts` above takes such a task (its `# Safety` names the same-layout case).
+  Tests: tests/same_layout_key.rs.
+
+One change since 0.1.4 stays: `derive_unsafe_wakeable_vtable!` calls the trait's `poll`, `wake` and
+`drop_in_place`, never an inherent method of the same name. 0.1.4's macro wrote `(*ptr).poll()`, and
+Rust picks an inherent `poll` over the trait's, so a type with both ran the inherent one through its
+vtable. 0.2.0 fixed that; it is now documented on the macro, with a doctest (src/lib.rs lines 733–762).
 
 ## 0.3.1
 

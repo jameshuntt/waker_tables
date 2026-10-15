@@ -9,7 +9,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::thread;
 
-use waker_tables::{declare_raw_waker_vtable, derive_arc_unsafe_wakeable, raw_waker_from_ptr, waker_from_arc, SmartWakerPtr};
+use waker_tables::{
+    declare_raw_waker_vtable, derive_arc_unsafe_wakeable, raw_waker_from_ptr, waker_from_arc, waker_from_arc_with_vtable,
+    SmartWakerPtr, UnsafeWakeable,
+};
 
 struct Signal {
     wakes: AtomicUsize,
@@ -176,16 +179,25 @@ fn smart_waker_ptr_drop_gives_the_ref_back() {
     assert_eq!(Arc::strong_count(&signal), 1);
 }
 
+/// `raw_waker_from_ptr` carries Signal's own vtable. The declared static is a separate one (its
+/// clone stays on it, as in 0.1.4: tests/declared_vtable.rs) and runs the same Signal functions.
 #[test]
-fn declared_static_is_the_types_own_vtable() {
+fn declared_static_runs_the_types_functions() {
     let signal = Signal::new();
     let raw = raw_waker_from_ptr(Arc::into_raw(signal.clone()));
     // SAFETY: `raw` carries a strong ref of an Arc<Signal> and Signal's own vtable.
     let waker = unsafe { std::task::Waker::from_raw(raw) };
-    assert_eq!(*waker.vtable(), SIGNAL_VTABLE);
-    assert_eq!(*waker_from_arc(signal.clone()).vtable(), SIGNAL_VTABLE);
+    assert!(std::ptr::eq(waker.vtable(), <Signal as UnsafeWakeable>::raw_waker_vtable()));
+
+    // SAFETY: SIGNAL_VTABLE is declared for Signal.
+    let declared = unsafe { waker_from_arc_with_vtable(signal.clone(), &SIGNAL_VTABLE) };
+    assert!(std::ptr::eq(declared.vtable(), &SIGNAL_VTABLE));
+    assert_eq!(Arc::strong_count(&signal), 3);
+
+    declared.wake_by_ref();
+    declared.wake();
     waker.wake();
-    assert_eq!(signal.wakes(), 1);
+    assert_eq!(signal.wakes(), 3);
     assert_eq!(Arc::strong_count(&signal), 1);
 }
 
