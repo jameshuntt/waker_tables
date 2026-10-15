@@ -408,7 +408,6 @@ This crate is for people who want to own their runtime boundaries.
 ---
 
 ## 0.4.0
-
 0.4.0 puts back five things 0.1.4 could do. Claude's earlier releases of this crate (0.2.0 and 0.3.0)
 took them out, and none of them had to go. Each one whose 0.1.4 form let safe code cause Undefined
 Behavior comes back as an `unsafe fn`, and its `# Safety` section says what the caller must guarantee;
@@ -417,9 +416,14 @@ show the compiler refusing it. Every safe function and type of 0.3.1 is unchange
 
 `declare_raw_waker_vtable!` is back to its 0.1.4 form, and that breaks code that built on 0.3.1 (two
 uses in one module, or comparing the static with `T::raw_waker_vtable()`), so this is 0.4.0, not a 0.3
-patch release: a `"0.3"` requirement does not pick it up. The same work was first prepared as 0.3.2,
-which was never published. Line numbers below are in the 0.4.0 tree.
+patch release: a `"0.3"` requirement does not pick it up. The same work was first prepared as 0.3.2; that
+number went instead to the `wake_by_ref` fix below, published on the 0.3 line. Line numbers below are in the 0.4.0 tree.
 
+- `derive_arc_unsafe_wakeable!`'s generated `wake_by_ref` names the trait (`<Self as UnsafeWakeable>::wake`
+  and `::clone_ptr`). 0.3.1 wrote `Self::wake(Self::clone_ptr(ptr))`, which picks a type's own function
+  first: a type with its own safe `clone_ptr` had it used in place of the trait's (a use-after-free under
+  Miri with no `unsafe` in the user's code), and a wake method named `wake`, as 0.1.4 allowed, did not
+  compile. Fixed for the 0.3 line in 0.3.2 too. `tests/inherent_names.rs` covers both.
 - **A vtable chosen per waker.** 0.1.4 had `waker_from_arc(arc, &VTABLE)` and
   `raw_waker_from_ptr(ptr, &VTABLE)`, both safe; 0.2.0 dropped the vtable argument. Now
   `unsafe fn waker_from_arc_with_vtable(arc, &VTABLE)` and `fn raw_waker_from_ptr_with_vtable(ptr, &VTABLE)`

@@ -1,6 +1,6 @@
 //! The `# Safety` sections a caller of the `unsafe` task functions relies on, read from the source.
 //! A contract is text, so these tests read the text: each one checks a clause the code needs and
-//! an earlier draft (0.3.2, or 0.4.0 at e5833df) left out or got wrong. 0.3.1 has no
+//! an earlier unpublished draft (first numbered 0.3.2, or 0.4.0 at e5833df) left out or got wrong. 0.3.1 has no
 //! `from_raw_parts`, so they fail there too.
 
 const LIB: &str = include_str!("../src/lib.rs");

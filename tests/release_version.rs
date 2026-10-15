@@ -11,6 +11,6 @@ fn the_declare_raw_waker_vtable_change_is_not_a_0_3_patch_release() {
 
     let readme = include_str!("../readme.md");
     assert!(readme.contains("\n## 0.4.0\n"), "the README has no 0.4.0 section");
-    assert!(!readme.contains("\n## 0.3.2\n"), "the README still has a 0.3.2 section; 0.3.2 was never released");
+    assert!(!readme.contains("\n## 0.3.2\n"), "the README has a 0.3.2 section; on main, 0.3.2's one fix is described under ## 0.4.0 (0.3.2 itself lives on the v0.3 branch)");
     assert!(!readme.contains("waker_tables = \"0.3\""), "the README's quick start still asks for 0.3");
 }

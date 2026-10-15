@@ -184,7 +184,7 @@ macro_rules! derive_arc_unsafe_wakeable {
             unsafe fn wake_by_ref(ptr: *const Self) {
                 // SAFETY: `ptr` points at a live Arc (trait contract); `clone_ptr` takes one more
                 // ref and `wake` consumes that one, so the caller's ref is untouched.
-                unsafe { Self::wake(Self::clone_ptr(ptr)) }
+                unsafe { <Self as $crate::UnsafeWakeable>::wake(<Self as $crate::UnsafeWakeable>::clone_ptr(ptr)) }
             }
 
             unsafe fn clone_ptr(ptr: *const Self) -> *const Self {
