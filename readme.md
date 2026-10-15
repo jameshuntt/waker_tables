@@ -89,7 +89,7 @@ Add the crate:
 
 ```toml
 [dependencies]
-waker_tables = "0.4"
+waker_tables = "0.3"
 ```
 
 ---
@@ -381,23 +381,23 @@ This crate is for people who want to own their runtime boundaries.
 
 ---
 
-## 0.4.0
+## 0.3.1
 
-- `derive_arc_unsafe_wakeable!` no longer lets safe code call an `unsafe fn`. 0.3 called your method
+- `derive_arc_unsafe_wakeable!` no longer lets safe code call an `unsafe fn`. 0.3.0 called your method
   inside the body of the `unsafe fn wake` it generated, so naming an `unsafe fn` method (your own, or
   one reached through `Deref`, such as `Option::unwrap_unchecked`) compiled with no `unsafe` anywhere
-  in your code, and Miri reported Undefined Behavior. 0.4 calls the method from a plain fn, so that
+  in your code, and Miri reported Undefined Behavior. 0.3.1 calls the method from a plain fn, so that
   is a compile error (E0133). A safe method works exactly as before.
 - A waker and its clones now carry one vtable address, so `will_wake` between them is `true` in
-  release builds too. In 0.3 the vtable was a constant, an optimized build could hold two copies of
+  release builds too. In 0.3.0 the vtable was a constant, an optimized build could hold two copies of
   it, and `cargo test --release` failed on `clone.will_wake(&waker)`. `UnsafeWakeable` has a new
   provided method, `raw_waker_vtable()`; `derive_arc_unsafe_wakeable!` overrides it with one `static`
   per type, and `waker_from_arc`, `raw_waker_from_ptr` and waker clones all use it. A manual impl
-  keeps the default (0.3's constant), so for it `will_wake` stays best-effort. CI now also runs
+  keeps the default (0.3.0's constant), so for it `will_wake` stays best-effort. CI now also runs
   `cargo test --release`.
-- `derive_arc_unsafe_wakeable!` now needs a sized type. It accepted an unsized one before, but no
+- `derive_arc_unsafe_wakeable!` now needs a sized type. 0.3.0 accepted an unsized one, but no
   waker could be built from it.
-- The `block_on` example honors its tick count: `Ticks::start(n, ..)` returns `n`. In 0.3 its future
+- The `block_on` example honors its tick count: `Ticks::start(n, ..)` returns `n`. In 0.3.0 its future
   checked a literal 3, so 2 hung forever and 4 returned 3.
 - The README said `UnsafeWakeableVTable` is three function pointers; it is five, and a doctest now
   checks both sizes.
