@@ -1,5 +1,5 @@
-//! A `RawWakerVTable` chosen per waker: `waker_from_arc_with_vtable` and
-//! `raw_waker_from_ptr_with_vtable`, 0.1.4's `waker_from_arc(arc, &VTABLE)` and
+//! A `RawWakerVTable` chosen per waker: `waker_from_arc_with_vtable` (`unsafe`) and
+//! `raw_waker_from_ptr_with_vtable` (safe), 0.1.4's `waker_from_arc(arc, &VTABLE)` and
 //! `raw_waker_from_ptr(ptr, &VTABLE)`. 0.3.1 has neither, so this file does not build there.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -122,9 +122,11 @@ fn two_wakers_of_one_type_carry_different_vtables() {
 #[test]
 fn raw_waker_from_ptr_with_vtable_builds_the_same_waker() {
     let signal = Signal::new();
-    // SAFETY: as above; the pointer owns the strong ref `Waker::from_raw` needs.
-    let raw = unsafe { raw_waker_from_ptr_with_vtable(Arc::into_raw(signal.clone()), &LOUD) };
-    // SAFETY: `raw` owns a strong ref of an Arc<Signal> and carries LOUD.
+    // Safe, as 0.1.4's raw_waker_from_ptr(ptr, &VTABLE) was: the RawWaker does nothing until
+    // Waker::from_raw below.
+    let raw = raw_waker_from_ptr_with_vtable(Arc::into_raw(signal.clone()), &LOUD);
+    // SAFETY: `raw` owns a strong ref of an Arc<Signal> and carries LOUD, which reads its data as an
+    // Arc<Signal> under Signal's refcount rules and clones onto LOUD.
     let waker = unsafe { Waker::from_raw(raw) };
     assert!(is_loud(&waker));
     assert_eq!(waker.data(), Arc::as_ptr(&signal) as *const ());

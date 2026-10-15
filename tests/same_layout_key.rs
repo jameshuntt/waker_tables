@@ -1,7 +1,8 @@
-//! A same-layout type under another type's key: a `#[repr(transparent)]` wrapper run through the
-//! inner type's vtable. 0.1.4's `RegisteredTask::new` accepted it unchecked. `new` now checks the
-//! type and refuses it; `RegisteredTask::from_raw_parts` (`unsafe`) takes it. 0.3.1 has no
-//! `from_raw_parts`, so this file does not build there.
+//! A `#[repr(transparent)]` wrapper under its inner type's key, run through the inner type's
+//! vtable. Its memory always holds a valid `Inner`, which is what `RegisteredTask::from_raw_parts`
+//! asks for; the same size and alignment alone would not be enough. 0.1.4's `RegisteredTask::new`
+//! accepted it unchecked. `new` now checks the type and refuses it; `RegisteredTask::from_raw_parts`
+//! (`unsafe`) takes it. 0.3.1 has no `from_raw_parts`, so this file does not build there.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -37,7 +38,7 @@ unsafe impl UnsafeWakeableTask for Inner {
 
 derive_unsafe_wakeable_vtable!(Inner, INNER_VTABLE);
 
-/// The same layout as `Inner`.
+/// `#[repr(transparent)]`: its memory is always a valid `Inner`.
 #[repr(transparent)]
 struct Wrapped(Inner);
 

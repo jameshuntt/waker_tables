@@ -375,10 +375,58 @@ pub fn waker_from_arc<T: UnsafeWakeable>(arc: Arc<T>) -> Waker {
 }
 
 /// Build a `RawWaker` for `T` from a raw `Arc` pointer and a vtable you choose (0.1's
-/// `raw_waker_from_ptr(ptr, &VTABLE)`).
+/// `raw_waker_from_ptr(ptr, &VTABLE)`, safe as it was there).
 ///
-/// The `RawWaker` is inert until `Waker::from_raw`, which is where `ptr` must own a strong ref of
-/// an `Arc<T>`.
+/// It is safe because the `RawWaker` is inert: std's `RawWaker::new`, which builds it, is safe too.
+///
+/// # Turning the result into a `Waker`
+///
+/// That takes `Waker::from_raw`, which is `unsafe`. Its caller must guarantee that `ptr` owns one
+/// strong ref of an `Arc<T>` and that `vtable` meets the contract in the `# Safety` section of
+/// [`waker_from_arc_with_vtable`], which does both steps in one call.
+///
+/// ```
+/// use std::sync::Arc;
+/// use std::sync::atomic::{AtomicUsize, Ordering};
+/// use std::task::Waker;
+/// use waker_tables::{declare_raw_waker_vtable, derive_arc_unsafe_wakeable, raw_waker_from_ptr_with_vtable};
+///
+/// struct Signal { wakes: AtomicUsize }
+/// impl Signal {
+///     fn on_wake(self: Arc<Self>) { self.wakes.fetch_add(1, Ordering::SeqCst); }
+/// }
+/// derive_arc_unsafe_wakeable!(Signal, on_wake);
+/// declare_raw_waker_vtable!(Signal, SIGNAL_VTABLE);
+///
+/// let signal = Arc::new(Signal { wakes: AtomicUsize::new(0) });
+/// // No `unsafe` here, as in 0.1.
+/// let raw = raw_waker_from_ptr_with_vtable(Arc::into_raw(signal.clone()), &SIGNAL_VTABLE);
+/// // SAFETY: `raw` owns one strong ref of an Arc<Signal>, and SIGNAL_VTABLE is declared for Signal.
+/// let waker = unsafe { Waker::from_raw(raw) };
+/// assert!(std::ptr::eq(waker.vtable(), &SIGNAL_VTABLE));
+/// waker.wake();
+/// assert_eq!(signal.wakes.load(Ordering::SeqCst), 1);
+/// assert_eq!(Arc::strong_count(&signal), 1);
+/// ```
+///
+/// [`raw_waker_from_ptr`] takes no vtable:
+///
+/// ```compile_fail,E0061
+/// # use std::sync::Arc;
+/// # use waker_tables::{derive_arc_unsafe_wakeable, raw_waker_from_ptr, UnsafeWakeable};
+/// # struct A; impl A { fn on_wake(self: Arc<Self>) {} } derive_arc_unsafe_wakeable!(A, on_wake);
+/// # struct B; impl B { fn on_wake(self: Arc<Self>) {} } derive_arc_unsafe_wakeable!(B, on_wake);
+/// let raw = raw_waker_from_ptr(Arc::into_raw(Arc::new(A)), B::raw_waker_vtable());
+/// ```
+pub fn raw_waker_from_ptr_with_vtable<T: UnsafeWakeable>(
+    ptr: *const T,
+    vtable: &'static RawWakerVTable,
+) -> RawWaker {
+    RawWaker::new(ptr as *const (), vtable)
+}
+
+/// Build a `Waker` from an `Arc<T>` and a vtable you choose (0.1's `waker_from_arc(arc, &VTABLE)`);
+/// the waker owns that strong ref.
 ///
 /// # Safety
 ///
@@ -391,40 +439,6 @@ pub fn waker_from_arc<T: UnsafeWakeable>(arc: Arc<T>) -> Waker {
 ///
 /// `T::raw_waker_vtable()` meets it, and so does a static declared with
 /// [`declare_raw_waker_vtable!`] for `T`.
-///
-/// Safe code cannot pass a vtable: calling this outside `unsafe` is refused, and
-/// [`raw_waker_from_ptr`] takes none.
-///
-/// ```compile_fail,E0133
-/// # use std::sync::Arc;
-/// # use waker_tables::{derive_arc_unsafe_wakeable, raw_waker_from_ptr_with_vtable, UnsafeWakeable};
-/// # struct A; impl A { fn on_wake(self: Arc<Self>) {} } derive_arc_unsafe_wakeable!(A, on_wake);
-/// # struct B; impl B { fn on_wake(self: Arc<Self>) {} } derive_arc_unsafe_wakeable!(B, on_wake);
-/// let raw = raw_waker_from_ptr_with_vtable(Arc::into_raw(Arc::new(A)), B::raw_waker_vtable());
-/// ```
-///
-/// ```compile_fail,E0061
-/// # use std::sync::Arc;
-/// # use waker_tables::{derive_arc_unsafe_wakeable, raw_waker_from_ptr, UnsafeWakeable};
-/// # struct A; impl A { fn on_wake(self: Arc<Self>) {} } derive_arc_unsafe_wakeable!(A, on_wake);
-/// # struct B; impl B { fn on_wake(self: Arc<Self>) {} } derive_arc_unsafe_wakeable!(B, on_wake);
-/// let raw = raw_waker_from_ptr(Arc::into_raw(Arc::new(A)), B::raw_waker_vtable());
-/// ```
-pub unsafe fn raw_waker_from_ptr_with_vtable<T: UnsafeWakeable>(
-    ptr: *const T,
-    vtable: &'static RawWakerVTable,
-) -> RawWaker {
-    RawWaker::new(ptr as *const (), vtable)
-}
-
-/// Build a `Waker` from an `Arc<T>` and a vtable you choose (0.1's `waker_from_arc(arc, &VTABLE)`);
-/// the waker owns that strong ref.
-///
-/// # Safety
-///
-/// `vtable` meets the contract of [`raw_waker_from_ptr_with_vtable`]: its functions read the data
-/// pointer as the `*const T` of an `Arc<T>` under [`UnsafeWakeable`]'s refcount rules, may run on
-/// any thread, and its `clone` returns a `RawWaker` whose vtable meets the same contract.
 ///
 /// ```
 /// use std::sync::Arc;
@@ -472,10 +486,10 @@ pub unsafe fn waker_from_arc_with_vtable<T: UnsafeWakeable>(
     arc: Arc<T>,
     vtable: &'static RawWakerVTable,
 ) -> Waker {
-    let ptr = Arc::into_raw(arc);
-    // SAFETY: `ptr` owns one strong ref of an `Arc<T>`, and `vtable` reads it as one under
-    // `UnsafeWakeable`'s rules (the caller's contract above).
-    unsafe { Waker::from_raw(raw_waker_from_ptr_with_vtable(ptr, vtable)) }
+    let raw = raw_waker_from_ptr_with_vtable(Arc::into_raw(arc), vtable);
+    // SAFETY: `raw`'s data pointer owns one strong ref of an `Arc<T>`, and `vtable` reads it as one
+    // under `UnsafeWakeable`'s rules (the caller's contract above).
+    unsafe { Waker::from_raw(raw) }
 }
 
 /* ================================
@@ -610,9 +624,10 @@ impl UnsafeWakeableVTable {
     ///
     /// Each function reads its data pointer as a live `T`, under the access the vtable's callers
     /// ([`UnsafeWakeablePtr`] and [`RegisteredTask`]) promise: `poll_fn` and `drop_fn` get a pointer
-    /// to a live `T` that nothing else uses during the call, `wake_fn` a pointer to a live `T`.
-    /// Beyond that, each function may rely only on its own documented contract, which the callers
-    /// of the `unsafe` `poll`, `wake` and `drop_in_place` methods uphold.
+    /// to a live `T`, valid for reads and writes, that nothing else uses during the call; `wake_fn`
+    /// gets a pointer to a live `T`, valid for reads. Beyond that, each function may rely only on its
+    /// own documented contract: the `# Safety` sections of the `unsafe` `poll`, `wake` and
+    /// `drop_in_place` methods name the vtable's function's contract, and their callers uphold it.
     ///
     /// Safe code cannot build a vtable by hand: calling this outside `unsafe` is refused, and the
     /// fields are private (the `E0451` example on [`UnsafeWakeableVTable`]).
@@ -690,26 +705,42 @@ pub struct UnsafeWakeablePtr {
 }
 
 impl UnsafeWakeablePtr {
+    /// Runs the vtable's `poll` function on `self.data`.
+    ///
     /// # Safety
-    /// `self.data` is a live task of the type `self.vtable` was built for, not used
-    /// elsewhere during the call; plus the task's own `poll` contract.
+    /// `self.data` points at a live task of the type `self.vtable` was built for, valid for reads
+    /// and writes, and nothing else uses it during the call. Plus the contract of the vtable's `poll`
+    /// function ([`UnsafeWakeableVTable::poll_fn`]): for a vtable from [`UnsafeWakeableVTable::of`]
+    /// or [`derive_unsafe_wakeable_vtable!`], that is `T`'s [`UnsafeWakeableTask::poll`]; for one
+    /// from [`UnsafeWakeableVTable::from_raw_parts`], it is the contract of the function passed as
+    /// `poll_fn`.
     pub unsafe fn poll(&mut self) -> Poll<()> {
         // SAFETY: the caller's contract above.
         unsafe { (self.vtable.poll_fn)(self.data) }
     }
 
+    /// Runs the vtable's `wake` function on `self.data`.
+    ///
     /// # Safety
-    /// `self.data` is a live task of the type `self.vtable` was built for; plus the task's
-    /// own `wake` contract.
+    /// `self.data` points at a live task of the type `self.vtable` was built for, valid for reads.
+    /// Plus the contract of the vtable's `wake` function ([`UnsafeWakeableVTable::wake_fn`]): for a
+    /// vtable from [`UnsafeWakeableVTable::of`] or [`derive_unsafe_wakeable_vtable!`], that is `T`'s
+    /// [`UnsafeWakeableTask::wake`]; for one from [`UnsafeWakeableVTable::from_raw_parts`], it is
+    /// the contract of the function passed as `wake_fn`.
     pub unsafe fn wake(&self) {
         // SAFETY: the caller's contract above.
         unsafe { (self.vtable.wake_fn)(self.data as *const ()) }
     }
 
-    /// Runs the task's cleanup hook; it does not free the task.
+    /// Runs the vtable's `drop` function, the task's cleanup hook, on `self.data`; it does not
+    /// free the task.
     ///
     /// # Safety
-    /// As [`UnsafeWakeablePtr::poll`], with the task's own `drop_in_place` contract.
+    /// As [`UnsafeWakeablePtr::poll`], with the contract of the vtable's `drop` function
+    /// ([`UnsafeWakeableVTable::drop_fn`]) in place of its `poll` function: for a vtable from
+    /// [`UnsafeWakeableVTable::of`] or [`derive_unsafe_wakeable_vtable!`], that is `T`'s
+    /// [`UnsafeWakeableTask::drop_in_place`]; for one from [`UnsafeWakeableVTable::from_raw_parts`],
+    /// it is the contract of the function passed as `drop_fn`.
     pub unsafe fn drop_in_place(&mut self) {
         // SAFETY: the caller's contract above.
         unsafe { (self.vtable.drop_fn)(self.data) }
@@ -985,10 +1016,11 @@ impl RegisteredTask {
     /// # Safety
     ///
     /// `ptr.data` points at a live task that `ptr.vtable`'s functions may read as the type the
-    /// vtable was built for (that type, or one with the same layout, such as a
-    /// `#[repr(transparent)]` wrapper of it). It stays valid for as long as the `RegisteredTask`
-    /// exists, and while a `poll`, `wake` or `drop_in_place` call on it runs, nothing else uses the
-    /// task.
+    /// vtable was built for (that type, or a `#[repr(transparent)]` wrapper of it, so that the
+    /// memory always holds a valid value of that type). `ptr.data` is valid for reads and writes of
+    /// that type: for example from `Box::into_raw` or `&mut x as *mut _`, never cast from a shared
+    /// reference `&x`. It stays valid for as long as the `RegisteredTask` exists, and while a
+    /// `poll`, `wake` or `drop_in_place` call on it runs, nothing else uses the task.
     ///
     /// Safe code still cannot pair a task with another type's vtable: calling this outside
     /// `unsafe` is refused, and [`new`](Self::new) panics on a key registered for another type.
@@ -1022,6 +1054,48 @@ impl RegisteredTask {
     /// For a task made by [`new`](Self::new), the caller now owns the `Box<T>` and must free it,
     /// with `drop(unsafe { Box::from_raw(ptr.data as *mut T) })`, or it leaks. For one made by
     /// [`from_raw_parts`](Self::from_raw_parts), the memory was the caller's all along.
+    ///
+    /// ```
+    /// use std::task::Poll;
+    /// use waker_tables::{derive_unsafe_wakeable_vtable, RegisteredTask, UnsafeWakeableTask, VTableKey, GLOBAL_VTABLE_REGISTRY};
+    ///
+    /// struct Steps { polls: u32 }
+    /// // SAFETY: the functions only touch `self`.
+    /// unsafe impl UnsafeWakeableTask for Steps {
+    ///     unsafe fn poll(&mut self) -> Poll<()> { self.polls += 1; Poll::Pending }
+    ///     unsafe fn wake(&self) {}
+    ///     unsafe fn drop_in_place(&mut self) {}
+    /// }
+    /// derive_unsafe_wakeable_vtable!(Steps, STEPS_VTABLE);
+    /// let key = VTableKey { segment: "docs", kind: "into-raw-parts", version: 1 };
+    /// GLOBAL_VTABLE_REGISTRY.register(key, &STEPS_VTABLE);
+    ///
+    /// let task = RegisteredTask::new(Box::new(Steps { polls: 0 }), key);
+    /// let (_, ptr) = task.into_raw_parts();
+    /// // SAFETY: `new` boxed a Steps, and the caller now owns that Box; it is freed once, here.
+    /// drop(unsafe { Box::from_raw(ptr.data as *mut Steps) });
+    /// ```
+    ///
+    /// Throwing the result away is warned about (`#[must_use]`), since a task made by `new` would
+    /// leak:
+    ///
+    /// ```compile_fail
+    /// #![deny(unused_must_use)]
+    /// # use std::task::Poll;
+    /// # use waker_tables::{derive_unsafe_wakeable_vtable, RegisteredTask, UnsafeWakeableTask, VTableKey, GLOBAL_VTABLE_REGISTRY};
+    /// # struct Steps { polls: u32 }
+    /// # unsafe impl UnsafeWakeableTask for Steps {
+    /// #     unsafe fn poll(&mut self) -> Poll<()> { self.polls += 1; Poll::Pending }
+    /// #     unsafe fn wake(&self) {}
+    /// #     unsafe fn drop_in_place(&mut self) {}
+    /// # }
+    /// # derive_unsafe_wakeable_vtable!(Steps, STEPS_VTABLE);
+    /// # let key = VTableKey { segment: "docs", kind: "into-raw-parts", version: 1 };
+    /// # GLOBAL_VTABLE_REGISTRY.register(key, &STEPS_VTABLE);
+    /// let task = RegisteredTask::new(Box::new(Steps { polls: 0 }), key);
+    /// task.into_raw_parts(); // unused_must_use: the Box leaks
+    /// ```
+    #[must_use = "a task made by `new` leaks unless `ptr.data` is freed as Box<T>"]
     pub fn into_raw_parts(self) -> (VTableKey, UnsafeWakeablePtr) {
         let this = ManuallyDrop::new(self);
         // SAFETY: `this` is never dropped, so the `ptr` read out here is the only copy left in use,
@@ -1040,26 +1114,41 @@ impl RegisteredTask {
         &self.ptr
     }
 
+    /// Runs the vtable's `poll` function on the task.
+    ///
     /// # Safety
-    /// The task's own `poll` contract.
+    /// The contract of the vtable's `poll` function ([`UnsafeWakeableVTable::poll_fn`]): for a
+    /// vtable from [`UnsafeWakeableVTable::of`] or [`derive_unsafe_wakeable_vtable!`], that is `T`'s
+    /// [`UnsafeWakeableTask::poll`]; for one from [`UnsafeWakeableVTable::from_raw_parts`], it is the
+    /// contract of the function passed as `poll_fn`.
     pub unsafe fn poll(&mut self) -> Poll<()> {
-        // SAFETY: the vtable is `T`'s (checked in `new`) and the task is live until `Drop`, or the
-        // caller of `from_raw_parts` promised both; `&mut self` makes the access exclusive (or
-        // `from_raw_parts`' caller promised nothing else uses it); the rest is the caller's.
+        // SAFETY: the vtable is `T`'s (checked in `new`) and the task is a live `Box<T>` until
+        // `Drop`, valid for reads and writes, or the caller of `from_raw_parts` promised all of
+        // that; `&mut self` makes the access exclusive (or `from_raw_parts`' caller promised nothing
+        // else uses it); the vtable function's own contract is the caller's.
         unsafe { self.ptr.poll() }
     }
 
+    /// Runs the vtable's `wake` function on the task.
+    ///
     /// # Safety
-    /// The task's own `wake` contract.
+    /// The contract of the vtable's `wake` function ([`UnsafeWakeableVTable::wake_fn`]): for a
+    /// vtable from [`UnsafeWakeableVTable::of`] or [`derive_unsafe_wakeable_vtable!`], that is `T`'s
+    /// [`UnsafeWakeableTask::wake`]; for one from [`UnsafeWakeableVTable::from_raw_parts`], it is the
+    /// contract of the function passed as `wake_fn`.
     pub unsafe fn wake(&self) {
         // SAFETY: as `poll`.
         unsafe { self.ptr.wake() }
     }
 
-    /// Run the task's cleanup hook. The task is still freed only when this is dropped.
+    /// Runs the vtable's `drop` function, the task's cleanup hook. The task is still freed only
+    /// when this is dropped.
     ///
     /// # Safety
-    /// The task's own `drop_in_place` contract.
+    /// The contract of the vtable's `drop` function ([`UnsafeWakeableVTable::drop_fn`]): for a
+    /// vtable from [`UnsafeWakeableVTable::of`] or [`derive_unsafe_wakeable_vtable!`], that is `T`'s
+    /// [`UnsafeWakeableTask::drop_in_place`]; for one from [`UnsafeWakeableVTable::from_raw_parts`],
+    /// it is the contract of the function passed as `drop_fn`.
     pub unsafe fn drop_in_place(&mut self) {
         // SAFETY: as `poll`.
         unsafe { self.ptr.drop_in_place() }
