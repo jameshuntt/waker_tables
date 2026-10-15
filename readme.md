@@ -355,3 +355,12 @@ This crate is for people who want to own their runtime boundaries.
 ## License
 
 MIT & Apache-2.0
+## Testing
+
+```bash
+cargo test
+cargo +nightly miri test
+MIRIFLAGS="-Zmiri-strict-provenance -Zmiri-many-seeds=0..8" cargo +nightly miri test
+```
+
+Miri reports a leaked task or a reference counted wrong; the tests check every `Arc` count and every task drop.

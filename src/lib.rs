@@ -35,14 +35,25 @@ pub unsafe trait UnsafeWakeable: Send + Sync + 'static {
 /// You implement your *behavior* on `Arc<T>` and this macro wires
 /// the raw pointer plumbing correctly.
 ///
-/// ```ignore
+/// ```
+/// use std::sync::Arc;
+/// use std::sync::atomic::{AtomicUsize, Ordering};
+/// use waker_tables::{declare_raw_waker_vtable, derive_arc_unsafe_wakeable, waker_from_arc};
+///
+/// struct SmartPinTask { wakes: AtomicUsize }
+///
 /// impl SmartPinTask {
 ///     pub fn on_wake(self: Arc<Self>) {
-///         self.scheduler.wake_stage(self.plan_id, self.id);
+///         self.wakes.fetch_add(1, Ordering::SeqCst);
 ///     }
 /// }
 ///
 /// derive_arc_unsafe_wakeable!(SmartPinTask, on_wake);
+/// declare_raw_waker_vtable!(SmartPinTask, SMARTPIN_TASK_RAW_VTABLE);
+///
+/// let task = Arc::new(SmartPinTask { wakes: AtomicUsize::new(0) });
+/// waker_from_arc(task.clone(), &SMARTPIN_TASK_RAW_VTABLE).wake();
+/// assert_eq!(task.wakes.load(Ordering::SeqCst), 1);
 /// ```
 #[macro_export]
 macro_rules! derive_arc_unsafe_wakeable {
@@ -81,17 +92,24 @@ macro_rules! derive_arc_unsafe_wakeable {
 ///
 /// This gives you a `'static` vtable constant that you can reuse everywhere.
 ///
-/// ```ignore
-/// use waker_tables::{UnsafeWakeable, declare_raw_waker_vtable, waker_from_arc};
+/// ```
+/// use std::sync::Arc;
+/// use std::task::Waker;
+/// use waker_tables::{declare_raw_waker_vtable, derive_arc_unsafe_wakeable, waker_from_arc};
 ///
-/// struct SmartPinTask { /* ... */ }
-/// unsafe impl UnsafeWakeable for SmartPinTask { /* ... */ }
+/// struct SmartPinTask;
+/// impl SmartPinTask {
+///     fn on_wake(self: Arc<Self>) {}
+/// }
+/// derive_arc_unsafe_wakeable!(SmartPinTask, on_wake);
 ///
 /// declare_raw_waker_vtable!(SmartPinTask, SMARTPIN_TASK_RAW_VTABLE);
 ///
 /// fn make_waker(task: Arc<SmartPinTask>) -> Waker {
 ///     waker_from_arc(task, &SMARTPIN_TASK_RAW_VTABLE)
 /// }
+///
+/// make_waker(Arc::new(SmartPinTask)).wake();
 /// ```
 #[macro_export]
 macro_rules! declare_raw_waker_vtable {
@@ -232,16 +250,30 @@ impl fmt::Debug for UnsafeWakeablePtr {
 /// Derive an `UnsafeWakeableVTable` for a concrete type that implements
 /// `UnsafeWakeableTask`.
 ///
-/// ```ignore
-/// struct SmartPinTask { /* ... */ }
+/// ```
+/// use std::task::Poll;
+/// use waker_tables::{derive_unsafe_wakeable_vtable, RegisteredTask, UnsafeWakeableTask, VTableKey, GLOBAL_VTABLE_REGISTRY};
+///
+/// struct SmartPinTask { polls: u32 }
 ///
 /// unsafe impl UnsafeWakeableTask for SmartPinTask {
-///     unsafe fn poll(&mut self) -> Poll<()> { /* ... */ }
-///     unsafe fn wake(&self) { /* ... */ }
-///     unsafe fn drop_in_place(&mut self) { /* ... */ }
+///     unsafe fn poll(&mut self) -> Poll<()> {
+///         self.polls += 1;
+///         if self.polls == 2 { Poll::Ready(()) } else { Poll::Pending }
+///     }
+///     unsafe fn wake(&self) {}
+///     unsafe fn drop_in_place(&mut self) {}
 /// }
 ///
 /// derive_unsafe_wakeable_vtable!(SmartPinTask, SMARTPIN_TASK_VTABLE);
+///
+/// let key = VTableKey { segment: "scheduler", kind: "smartpin", version: 1 };
+/// GLOBAL_VTABLE_REGISTRY.register(key, &SMARTPIN_TASK_VTABLE);
+///
+/// let mut task = RegisteredTask::new(Box::new(SmartPinTask { polls: 0 }), key);
+/// assert_eq!(unsafe { task.poll() }, Poll::Pending);
+/// assert_eq!(unsafe { task.poll() }, Poll::Ready(()));
+/// // dropping `task` frees the SmartPinTask
 /// ```
 #[macro_export]
 macro_rules! derive_unsafe_wakeable_vtable {
@@ -340,6 +372,18 @@ pub static GLOBAL_VTABLE_REGISTRY: LazyLock<VTableRegistry> = LazyLock::new(VTab
 pub struct RegisteredTask {
     pub key: VTableKey,
     pub ptr: UnsafeWakeablePtr,
+    // Frees the box `new` took: `T` is known only there, so its free fn is kept here.
+    free: unsafe fn(*mut ()),
+}
+
+unsafe fn free_box<T>(data: *mut ()) {
+    drop(unsafe { Box::from_raw(data as *mut T) });
+}
+
+impl Drop for RegisteredTask {
+    fn drop(&mut self) {
+        unsafe { (self.free)(self.ptr.data) }
+    }
 }
 
 impl RegisteredTask {
@@ -361,6 +405,7 @@ impl RegisteredTask {
                 data: Box::into_raw(task) as *mut (),
                 vtable,
             },
+            free: free_box::<T>,
         }
     }
 
@@ -434,5 +479,37 @@ mod tests {
             registered.wake();
             registered.drop_in_place();
         }
+    }
+
+    static FREED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    struct Counted(#[allow(dead_code)] Vec<u8>);
+
+    impl Drop for Counted {
+        fn drop(&mut self) {
+            FREED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    unsafe impl UnsafeWakeableTask for Counted {
+        unsafe fn poll(&mut self) -> Poll<()> { Poll::Ready(()) }
+        unsafe fn wake(&self) {}
+        unsafe fn drop_in_place(&mut self) {}
+    }
+
+    derive_unsafe_wakeable_vtable!(Counted, COUNTED_VTABLE);
+
+    #[test]
+    fn registered_task_frees_its_task_once() {
+        let key = VTableKey { segment: "test", kind: "counted", version: 1 };
+        GLOBAL_VTABLE_REGISTRY.register(key, &COUNTED_VTABLE);
+        let mut registered = RegisteredTask::new(Box::new(Counted(vec![1, 2, 3])), key);
+        unsafe {
+            let _ = registered.poll();
+            registered.drop_in_place();
+        }
+        assert_eq!(FREED.load(std::sync::atomic::Ordering::SeqCst), 0);
+        drop(registered);
+        assert_eq!(FREED.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 }
